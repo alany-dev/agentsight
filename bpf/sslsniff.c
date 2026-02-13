@@ -16,6 +16,9 @@
 #include <locale.h>
 #include <wchar.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 #include "sslsniff.skel.h"
 #include "sslsniff.h"
@@ -51,6 +54,25 @@
 	__ATTACH_UPROBE_CHECKED(skel, binary_path, sym_name, prog_name, false)
 #define ATTACH_URETPROBE_CHECKED(skel, binary_path, sym_name, prog_name)  \
 	__ATTACH_UPROBE_CHECKED(skel, binary_path, sym_name, prog_name, true)
+
+#define __ATTACH_UPROBE_OFFSET(skel, binary_path, offset, prog_name, is_retprobe) \
+	do {                                                                          \
+	  LIBBPF_OPTS(bpf_uprobe_opts, uprobe_opts, .retprobe = is_retprobe);         \
+	  skel->links.prog_name = bpf_program__attach_uprobe_opts(                    \
+		  skel->progs.prog_name, env.pid, binary_path, offset, &uprobe_opts);     \
+	} while (false)
+
+#define ATTACH_UPROBE_OFFSET_CHECKED(skel, binary_path, offset, prog_name)       \
+	do {                                                                         \
+	  __ATTACH_UPROBE_OFFSET(skel, binary_path, offset, prog_name, false);       \
+	  __CHECK_PROGRAM(skel, prog_name);                                          \
+	} while (false)
+
+#define ATTACH_URETPROBE_OFFSET_CHECKED(skel, binary_path, offset, prog_name)    \
+	do {                                                                         \
+	  __ATTACH_UPROBE_OFFSET(skel, binary_path, offset, prog_name, true);        \
+	  __CHECK_PROGRAM(skel, prog_name);                                          \
+	} while (false)
 
 volatile sig_atomic_t exiting = 0;
 
@@ -110,6 +132,148 @@ static const struct argp_option opts[] = {
 };
 
 static bool verbose = false;
+
+/*
+ * BoringSSL function offset detection for stripped binaries.
+ *
+ * When a binary (e.g., Bun-based apps like Claude CLI) statically links
+ * BoringSSL and strips symbols, we can still find SSL_write/SSL_read/
+ * SSL_do_handshake by searching for their unique function prologue byte
+ * patterns. These patterns are derived from Bun v1.3.x profile builds.
+ */
+struct boringssl_offsets {
+	size_t ssl_write;
+	size_t ssl_read;
+	size_t ssl_do_handshake;
+	bool found;
+};
+
+static size_t find_pattern(const unsigned char *data, size_t data_len,
+						   const unsigned char *pattern, size_t pattern_len)
+{
+	if (pattern_len > data_len)
+		return (size_t)-1;
+	for (size_t i = 0; i <= data_len - pattern_len; i++) {
+		if (memcmp(data + i, pattern, pattern_len) == 0)
+			return i;
+	}
+	return (size_t)-1;
+}
+
+static struct boringssl_offsets find_boringssl_offsets(const char *binary_path) {
+	struct boringssl_offsets result = { .found = false };
+	int fd = -1;
+	struct stat st;
+	unsigned char *data = NULL;
+
+	/* BoringSSL SSL_do_handshake prologue (24 bytes) */
+	static const unsigned char handshake_pat[] = {
+		0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
+		0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec,
+		0x28, 0x49, 0x89, 0xfc, 0x48, 0x8b, 0x47, 0x30
+	};
+
+	/* BoringSSL SSL_read prologue (19 bytes) */
+	static const unsigned char read_pat[] = {
+		0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
+		0x53, 0x50, 0x48, 0x83, 0xbf, 0x98, 0x00, 0x00,
+		0x00, 0x00, 0x74
+	};
+
+	/* BoringSSL SSL_write prologue (26 bytes) */
+	static const unsigned char write_pat[] = {
+		0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
+		0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec,
+		0x18, 0x41, 0x89, 0xd7, 0x49, 0x89, 0xf6, 0x48,
+		0x89, 0xfb
+	};
+
+	/* Known relative distances between functions (from Bun v1.3.x) */
+	static const size_t READ_HANDSHAKE_DELTA = 0x6F0;
+	static const size_t WRITE_READ_DELTA = 0xCA0;
+
+	fd = open(binary_path, O_RDONLY);
+	if (fd < 0) {
+		fprintf(stderr, "Failed to open %s: %s\n", binary_path, strerror(errno));
+		return result;
+	}
+
+	if (fstat(fd, &st) < 0) {
+		fprintf(stderr, "Failed to stat %s: %s\n", binary_path, strerror(errno));
+		close(fd);
+		return result;
+	}
+
+	data = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+	if (data == MAP_FAILED) {
+		fprintf(stderr, "Failed to mmap %s: %s\n", binary_path, strerror(errno));
+		close(fd);
+		return result;
+	}
+
+	/* Find SSL_read (most unique pattern), then validate nearby functions */
+	size_t read_off = find_pattern(data, st.st_size, read_pat, sizeof(read_pat));
+	if (read_off == (size_t)-1) {
+		if (verbose)
+			fprintf(stderr, "BoringSSL: SSL_read pattern not found\n");
+		goto out;
+	}
+
+	/* Check if SSL_do_handshake is at expected relative position */
+	if (read_off >= READ_HANDSHAKE_DELTA) {
+		size_t expected_hs = read_off - READ_HANDSHAKE_DELTA;
+		if (memcmp(data + expected_hs, handshake_pat, sizeof(handshake_pat)) == 0) {
+			result.ssl_do_handshake = expected_hs;
+		}
+	}
+	if (result.ssl_do_handshake == 0) {
+		/* Fallback: search independently */
+		size_t hs_off = find_pattern(data, st.st_size, handshake_pat, sizeof(handshake_pat));
+		if (hs_off == (size_t)-1) {
+			if (verbose)
+				fprintf(stderr, "BoringSSL: SSL_do_handshake pattern not found\n");
+			goto out;
+		}
+		result.ssl_do_handshake = hs_off;
+	}
+
+	result.ssl_read = read_off;
+
+	/* Check if SSL_write is at expected relative position */
+	size_t expected_wr = read_off + WRITE_READ_DELTA;
+	if (expected_wr + sizeof(write_pat) <= (size_t)st.st_size &&
+		memcmp(data + expected_wr, write_pat, sizeof(write_pat)) == 0) {
+		result.ssl_write = expected_wr;
+	} else {
+		/* Fallback: search near read function */
+		size_t search_start = read_off;
+		size_t search_end = read_off + 0x10000;
+		if (search_end > (size_t)st.st_size)
+			search_end = st.st_size;
+		size_t wr_off = find_pattern(data + search_start,
+									 search_end - search_start,
+									 write_pat, sizeof(write_pat));
+		if (wr_off == (size_t)-1) {
+			if (verbose)
+				fprintf(stderr, "BoringSSL: SSL_write pattern not found near SSL_read\n");
+			goto out;
+		}
+		result.ssl_write = search_start + wr_off;
+	}
+
+	result.found = true;
+	if (verbose) {
+		fprintf(stderr, "BoringSSL detected in %s:\n", binary_path);
+		fprintf(stderr, "  SSL_do_handshake offset: 0x%lx\n", result.ssl_do_handshake);
+		fprintf(stderr, "  SSL_read offset:         0x%lx\n", result.ssl_read);
+		fprintf(stderr, "  SSL_write offset:        0x%lx\n", result.ssl_write);
+	}
+
+out:
+	munmap(data, st.st_size);
+	close(fd);
+	return result;
+}
 
 static error_t parse_arg(int key, char *arg, struct argp_state *state) {
 	switch (key) {
@@ -206,6 +370,25 @@ int attach_nss(struct sslsniff_bpf *skel, const char *lib) {
 	ATTACH_URETPROBE_CHECKED(skel, lib, PR_Read, probe_SSL_read_exit);
 	ATTACH_UPROBE_CHECKED(skel, lib, PR_Recv, probe_SSL_rw_enter);
 	ATTACH_URETPROBE_CHECKED(skel, lib, PR_Recv, probe_SSL_read_exit);
+
+	return 0;
+}
+
+int attach_openssl_by_offset(struct sslsniff_bpf *skel, const char *lib,
+							 struct boringssl_offsets *offsets) {
+	ATTACH_UPROBE_OFFSET_CHECKED(skel, lib, offsets->ssl_write, probe_SSL_rw_enter);
+	ATTACH_URETPROBE_OFFSET_CHECKED(skel, lib, offsets->ssl_write, probe_SSL_write_exit);
+	ATTACH_UPROBE_OFFSET_CHECKED(skel, lib, offsets->ssl_read, probe_SSL_rw_enter);
+	ATTACH_URETPROBE_OFFSET_CHECKED(skel, lib, offsets->ssl_read, probe_SSL_read_exit);
+
+	/* BoringSSL does not have SSL_write_ex/SSL_read_ex, skip those */
+
+	if (env.handshake) {
+		ATTACH_UPROBE_OFFSET_CHECKED(skel, lib, offsets->ssl_do_handshake,
+									 probe_SSL_do_handshake_enter);
+		ATTACH_URETPROBE_OFFSET_CHECKED(skel, lib, offsets->ssl_do_handshake,
+										 probe_SSL_do_handshake_exit);
+	}
 
 	return 0;
 }
@@ -513,13 +696,35 @@ int main(int argc, char **argv) {
 		}
 	}
 
-	// Handle custom binary path for statically-linked SSL (e.g., NVM Node.js)
+	// Handle custom binary path for statically-linked SSL (e.g., NVM Node.js, Bun apps)
 	if (env.extra_lib) {
 		if (verbose) {
 			fprintf(stderr, "Attaching to binary: %s\n", env.extra_lib);
 		}
-		// For binaries with statically-linked OpenSSL, try to attach OpenSSL functions
-		attach_openssl(obj, env.extra_lib);
+		// First try symbol-based attachment (works for binaries with symbols)
+		LIBBPF_OPTS(bpf_uprobe_opts, test_opts, .func_name = "SSL_write",
+					.retprobe = false);
+		struct bpf_link *test_link = bpf_program__attach_uprobe_opts(
+			obj->progs.probe_SSL_rw_enter, env.pid, env.extra_lib, 0, &test_opts);
+		if (test_link) {
+			// Symbol found - use standard symbol-based attachment
+			bpf_link__destroy(test_link);
+			if (verbose)
+				fprintf(stderr, "Using symbol-based attachment for %s\n", env.extra_lib);
+			attach_openssl(obj, env.extra_lib);
+		} else {
+			// Symbol not found - try BoringSSL pattern detection
+			if (verbose)
+				fprintf(stderr, "Symbols not found, trying BoringSSL pattern detection...\n");
+			struct boringssl_offsets offsets = find_boringssl_offsets(env.extra_lib);
+			if (offsets.found) {
+				fprintf(stderr, "BoringSSL detected! Attaching by offset...\n");
+				attach_openssl_by_offset(obj, env.extra_lib, &offsets);
+			} else {
+				warn("Failed to attach to %s: no SSL symbols or BoringSSL patterns found\n",
+					 env.extra_lib);
+			}
+		}
 	}
 
 	rb = ring_buffer__new(bpf_map__fd(obj->maps.rb), handle_event, NULL, NULL);
