@@ -341,43 +341,98 @@ All events follow a common base schema with event-specific fields:
 
 ### SSL Traffic Monitor JSON Events
 
-**SSL Traffic Events:**
+Each SSL event is a single JSON line with the following schema:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `function` | string | `"READ/RECV"`, `"WRITE/SEND"`, or `"HANDSHAKE"` |
+| `timestamp_ns` | uint64 | Nanoseconds since system boot (`bpf_ktime_get_ns()`) |
+| `comm` | string | Thread name (max 16 chars), e.g. `"curl"`, `"HTTP Client"` |
+| `pid` | int32 | Process ID (tgid) |
+| `tid` | int32 | Thread ID |
+| `uid` | uint32 | User ID |
+| `len` | int32 | Total bytes returned by SSL_read/SSL_write |
+| `buf_size` | uint32 | Actual bytes copied into the event buffer (may be < `len`) |
+| `latency_ms` | float | Time between entry and exit of SSL_read/SSL_write, in milliseconds |
+| `is_handshake` | bool | `true` if this is a handshake event |
+| `data` | string\|null | Decrypted plaintext content (JSON-escaped), or `null` if no data |
+| `truncated` | bool | `true` if `buf_size < len` (data exceeded 512KB buffer) |
+| `bytes_lost` | int | Only present when `truncated` is `true`: `len - buf_size` |
+
+**SSL Read/Write Events:**
 ```json
 {
-  "timestamp": 1234567890123456789,
-  "event": "SSL_READ",
-  "comm": "curl",
-  "pid": 1234,
+  "function": "WRITE/SEND",
+  "timestamp_ns": 242692590000000,
+  "comm": "HTTP Client",
+  "pid": 959023,
+  "tid": 959035,
   "uid": 1000,
-  "data": "GET / HTTP/1.1\r\nHost: example.com\r\n",
-  "data_len": 32,
+  "len": 2865,
+  "buf_size": 2865,
+  "latency_ms": 0.042,
+  "is_handshake": false,
+  "data": "POST /v1/messages?beta=true HTTP/1.1\r\nHost: api.anthropic.com\r\n...",
   "truncated": false
 }
 
 {
-  "timestamp": 1234567890123456789,
-  "event": "SSL_WRITE", 
-  "comm": "curl",
-  "pid": 1234,
+  "function": "READ/RECV",
+  "timestamp_ns": 242692596213720,
+  "comm": "HTTP Client",
+  "pid": 959023,
+  "tid": 959035,
   "uid": 1000,
-  "data": "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n",
-  "data_len": 45,
+  "len": 1192,
+  "buf_size": 1192,
+  "latency_ms": 0.014,
+  "is_handshake": false,
+  "data": "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\n...",
   "truncated": false
 }
 ```
 
-**SSL Handshake Events:**
+**Truncated event** (when data exceeds 512KB buffer):
 ```json
 {
-  "timestamp": 1234567890123456789,
-  "event": "SSL_HANDSHAKE",
-  "comm": "curl",
-  "pid": 1234,
+  "function": "WRITE/SEND",
+  "timestamp_ns": 242692590000000,
+  "comm": "HTTP Client",
+  "pid": 959023,
+  "tid": 959035,
   "uid": 1000,
+  "len": 600000,
+  "buf_size": 524288,
+  "latency_ms": 0.100,
+  "is_handshake": false,
+  "data": "POST /v1/messages ...(first 512KB)...",
+  "truncated": true,
+  "bytes_lost": 75712
+}
+```
+
+**SSL Handshake Events** (only with `--handshake` / `-h` flag):
+```json
+{
+  "function": "HANDSHAKE",
+  "timestamp_ns": 242692580000000,
+  "comm": "HTTP Client",
+  "pid": 959023,
+  "tid": 959035,
+  "uid": 1000,
+  "len": 0,
+  "buf_size": 0,
+  "latency_ms": 12.345,
+  "is_handshake": true,
   "data": null,
   "truncated": false
 }
 ```
+
+**Notes:**
+- `comm` is the **thread name** from `bpf_get_current_comm()`, not the process name. For example, Claude Code's SSL traffic shows `"HTTP Client"`, not `"claude"`.
+- `data` contains the decrypted plaintext. Control characters are JSON-escaped (`\n`, `\r`, `\t`, `\uXXXX`). Valid UTF-8 sequences are passed through.
+- `len` is what SSL_read/SSL_write returned. `buf_size` is what was actually copied (capped at 512KB).
 
 ### Common Usage Patterns
 
