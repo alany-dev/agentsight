@@ -11,14 +11,16 @@ AgentSight is a observability tool designed specifically for monitoring LLM agen
 
 ```bash
 wget https://github.com/eunomia-bpf/agentsight/releases/latest/download/agentsight && chmod +x agentsight
-# Record agent behavior from claude
+# Record Claude Code activity (Bun-based, requires --binary-path for statically-linked BoringSSL)
+sudo ./agentsight record -c claude --binary-path ~/.local/share/claude/versions/$(claude --version | head -1)
+# Record agent behavior from claude (old version)
 sudo ./agentsight record -c "claude"
 # Record agent behavior from gemini-cli (comm is "node")
 sudo ./agentsight record -c "node"
-# For Python AI tools
+# For Python AI tools (e.g. aider, open-interpreter)
 sudo ./agentsight record -c "python"
-# Record claude or gemini activity with NVM Node.js, if bundle OpenSSL statically
-sudo ./agentsight record --binary-path /usr/bin/node -c node
+# For Node.js apps with NVM (statically-linked OpenSSL)
+sudo ./agentsight record -c node --binary-path ~/.nvm/versions/node/v20.0.0/bin/node
 ```
 
 Visit [http://127.0.0.1:7395](http://127.0.0.1:7395) to view the recorded data.
@@ -131,11 +133,20 @@ eBPF Programs → JSON Events → Runners → Analyzer Chain → Frontend/Storag
 AgentSight runs in Docker with `--privileged` for eBPF, `--pid=host` to access host processes, `-v /sys:/sys:ro` for process monitoring, and `-v /usr:/usr:ro -v /lib:/lib:ro` for SSL library access (required to attach uprobes to shared libraries like `libssl.so`). Example:
 
 ```bash
+# Monitor Python AI tools
 docker run --privileged --pid=host --network=host \
   -v /sys:/sys:ro -v /usr:/usr:ro -v /lib:/lib:ro \
   -v $(pwd)/logs:/logs \
   ghcr.io/eunomia-bpf/agentsight:latest \
-  record --comm claude --log-file /logs/record.log
+  record --comm python --log-file /logs/record.log
+
+# Monitor Claude Code (mount home dir for binary access)
+docker run --privileged --pid=host --network=host \
+  -v /sys:/sys:ro -v /usr:/usr:ro -v /lib:/lib:ro \
+  -v $HOME/.local/share/claude:/claude:ro \
+  -v $(pwd)/logs:/logs \
+  ghcr.io/eunomia-bpf/agentsight:latest \
+  record --comm claude --binary-path /claude/versions/2.1.39 --log-file /logs/record.log
 ```
 
 #### Option 2: Build from Source
@@ -160,33 +171,78 @@ make build
 
 ### Usage Examples
 
-#### Advanced Monitoring
+#### Monitoring Claude Code
+
+Claude Code is a Bun-based application with BoringSSL statically linked and
+symbols stripped. AgentSight auto-detects BoringSSL functions via byte-pattern
+matching when `--binary-path` is provided:
 
 ```bash
-# Combined SSL and process monitoring with web interface
-sudo ./agentsight trace --ssl --process --server
+# Find the Claude binary version
+CLAUDE_BIN=~/.local/share/claude/versions/$(claude --version | head -1)
+
+# Record all Claude activity with web UI
+sudo ./agentsight record -c claude --binary-path "$CLAUDE_BIN"
+# Open http://127.0.0.1:7395 to view timeline
+
+# Advanced: full trace with custom filters
+sudo ./agentsight trace --ssl true --process true --comm claude \
+  --binary-path "$CLAUDE_BIN" --server true --server-port 8080
+```
+
+This captures:
+- **Conversation API**: `POST /v1/messages` requests with full prompt/response SSE streaming
+- **Telemetry**: heartbeat, event logging, Datadog logs
+- **Process activity**: file operations, subprocess executions
+
+> **Note**: All SSL traffic in Claude flows through an internal "HTTP Client"
+> thread, not the main "claude" thread. When `--binary-path` is specified,
+> the `--comm` filter is automatically skipped for SSL monitoring (but still
+> applied for process monitoring) to ensure traffic is captured correctly.
+
+#### Monitoring Python AI Tools
+
+```bash
+# Monitor aider, open-interpreter, or any Python-based AI tool
+sudo ./agentsight record -c "python"
 
 # Custom port and log file
 sudo ./agentsight record -c "python" --server-port 8080 --log-file /tmp/agent.log
 ```
 
-#### NVM Node.js Applications
+#### Monitoring Node.js AI Tools (Gemini CLI, etc.)
 
-For Node.js installed via NVM, use the `--binary-path` option:
+For Node.js applications installed via NVM that statically link OpenSSL, use
+`--binary-path` to point to the actual Node.js binary:
 
 ```bash
-# Monitor Node.js applications with statically-linked SSL
-sudo ./agentsight ssl --binary-path ~/.nvm/versions/node/v20.0.0/bin/node --comm node
+# Monitor Gemini CLI or other Node.js AI tools
+sudo ./agentsight record -c node --binary-path ~/.nvm/versions/node/v20.0.0/bin/node
 
-# Record with custom binary path
-sudo ./agentsight record -c node -- --binary-path ~/.nvm/versions/node/v20.0.0/bin/node
+# Or with system Node.js (uses dynamic libssl, no --binary-path needed)
+sudo ./agentsight record -c node
+```
+
+#### Advanced Monitoring
+
+```bash
+# Combined SSL and process monitoring with web interface
+sudo ./agentsight trace --ssl true --process true --server true
+
+# Custom port and log file
+sudo ./agentsight record -c "python" --server-port 8080 --log-file /tmp/agent.log
 ```
 
 #### Direct eBPF Program Usage
 
 ```bash
-# Run eBPF programs directly for development/testing
+# Run sslsniff directly on Claude binary
+sudo ./bpf/sslsniff --binary-path ~/.local/share/claude/versions/2.1.39
+
+# Run sslsniff on NVM Node.js
 sudo ./bpf/sslsniff --binary-path ~/.nvm/versions/node/v20.0.0/bin/node --verbose
+
+# Run process tracer
 sudo ./bpf/process -c python
 ```
 
@@ -222,8 +278,11 @@ A: Yes, use combined monitoring modes for concurrent multi-agent observation wit
 **Q: How do I filter sensitive data?**  
 A: Built-in analyzers can remove authentication headers and filter specific content patterns.
 
-**Q: Why doesn't AgentSight capture traffic from my NVM Node.js application?**
-A: NVM Node.js binaries statically link OpenSSL instead of using system libraries. See the "NVM Node.js Applications" section for `--binary-path` usage examples.
+**Q: Why doesn't AgentSight capture traffic from Claude Code or NVM Node.js?**
+A: These applications statically link their SSL library (BoringSSL for Claude/Bun, OpenSSL for NVM Node.js) instead of using system `libssl.so`. Use `--binary-path` to point to the actual binary so AgentSight can auto-detect SSL functions via byte-pattern matching. See the "Monitoring Claude Code" and "Monitoring Node.js AI Tools" sections for examples.
+
+**Q: Why does `--comm claude` not capture SSL traffic?**
+A: Claude Code's SSL traffic runs on an internal "HTTP Client" thread, not the main "claude" thread. The `--comm` filter in sslsniff matches thread name (from `bpf_get_current_comm()`), not process name. When using `--binary-path`, the collector automatically skips the `--comm` filter for SSL monitoring.
 
 ### Troubleshooting
 

@@ -103,15 +103,17 @@ sudo ./sslsniff [OPTIONS]
 | `--pid=PID` | `-p PID` | Trace only this specific PID | all |
 | `--uid=UID` | `-u UID` | Trace only this specific UID | all |
 | `--comm=COMMAND` | `-c COMMAND` | Trace only commands matching string | all |
+| `--binary-path` | - | Path to binary with statically-linked SSL | auto-detect |
 | `--no-openssl` | `-o` | Disable OpenSSL traffic capture | enabled |
 | `--no-gnutls` | `-g` | Disable GnuTLS traffic capture | disabled |
 | `--no-nss` | `-n` | Disable NSS traffic capture | disabled |
 | `--handshake` | `-h` | Show SSL handshake events | disabled |
 
 **SSL Library Support:**
-- **OpenSSL**: Enabled by default (most common)
+- **OpenSSL**: Enabled by default (most common), attaches to system `libssl.so`
 - **GnuTLS**: Disabled by default, enable with `--gnutls` or disable OpenSSL with `--no-openssl`
 - **NSS**: Disabled by default, enable with `--nss`
+- **BoringSSL** (statically linked): Auto-detected via byte-pattern matching when `--binary-path` is provided. Works with stripped binaries (no symbols required).
 
 **Examples:**
 ```bash
@@ -139,6 +141,36 @@ sudo ./sslsniff -v -h -p 1234
 # Monitor multiple criteria
 sudo ./sslsniff -c "python" -u 1000 -h
 ```
+
+**Monitoring applications with statically-linked SSL (BoringSSL/OpenSSL):**
+
+Some applications (e.g., Claude Code/Bun, NVM Node.js) statically link their
+SSL library instead of using the system `libssl.so`. For these, use
+`--binary-path` to point to the actual executable:
+
+```bash
+# Monitor Claude Code (Bun with statically-linked BoringSSL)
+# Note: do NOT use -c claude, because SSL traffic comes from "HTTP Client" thread
+sudo ./sslsniff --binary-path ~/.local/share/claude/versions/2.1.39
+
+# Monitor NVM Node.js (statically-linked OpenSSL)
+sudo ./sslsniff --binary-path ~/.nvm/versions/node/v20.0.0/bin/node
+
+# With verbose output to see detected offsets
+sudo ./sslsniff --binary-path ~/.local/share/claude/versions/2.1.39 --verbose
+# stderr: BoringSSL detected! SSL_read=0x5c38e80, SSL_write=0x5c39b20, ...
+```
+
+When `--binary-path` is specified, sslsniff:
+1. First tries to resolve `SSL_read`/`SSL_write` symbols from the binary
+2. If symbols are not found (stripped binary), falls back to BoringSSL
+   byte-pattern detection to find function offsets automatically
+3. Attaches uprobes at the detected offsets
+
+> **Important**: The `-c` (comm) filter matches the **thread name** from
+> `bpf_get_current_comm()`, not the process name. For applications like
+> Claude Code where SSL runs on a dedicated "HTTP Client" thread, using
+> `-c claude` will filter out all traffic. Omit `-c` when using `--binary-path`.
 
 **Output Format:**
 - Each SSL event is output as a JSON object

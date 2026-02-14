@@ -1,6 +1,7 @@
 # Claude Code CLI: Architecture Analysis & SSL Monitoring
 
-This document records the complete reverse engineering process of the Claude
+This document records the complete reverse
+ engineering process of the Claude
 Code CLI binary, every approach attempted, commands executed, failures
 encountered, and the current status of SSL traffic interception.
 
@@ -20,8 +21,10 @@ encountered, and the current status of SSL traffic interception.
 6. [Phase 5: Implementing Byte-Pattern Detection](#phase-5-implementing-byte-pattern-detection)
 7. [Phase 6: Testing — Partial Success](#phase-6-testing--partial-success)
 8. [Phase 7: The Two-Path TLS Problem](#phase-7-the-two-path-tls-problem)
-9. [Current Status & Next Steps](#current-status--next-steps)
-10. [Appendix: Claude Binary Architecture](#appendix-claude-binary-architecture)
+9. [Phase 8: Deep Investigation of the Native Fetch TLS Path](#phase-8-deep-investigation-of-the-native-fetch-tls-path)
+10. [Phase 9: Breakthrough — Full /v1/messages Capture](#phase-9-breakthrough--full-v1messages-capture)
+11. [Current Status & Next Steps](#current-status--next-steps)
+12. [Appendix: Claude Binary Architecture](#appendix-claude-binary-architecture)
 
 ---
 
@@ -30,13 +33,7 @@ encountered, and the current status of SSL traffic interception.
 Claude Code CLI is a **Bun v1.3.9-canary** application with **BoringSSL**
 statically linked and symbols stripped. We successfully modified `sslsniff` to
 auto-detect BoringSSL functions via byte-pattern matching and can now capture
-**telemetry, heartbeat, and logging traffic** (via `axios` HTTP client).
-
-However, the **main conversation API** (`/v1/messages`) uses Bun's native
-`fetch()` which goes through the **uSockets** TLS layer — a completely
-different code path that does NOT call `SSL_write`/`SSL_read`. Capturing
-prompt data requires additional hooks on uSockets functions (`ssl_on_data`,
-etc.), which is identified but not yet implemented.
+**ALL SSL/TLS traffic** including the conversation API (`/v1/messages`).
 
 ### What works
 
@@ -45,13 +42,19 @@ etc.), which is identified but not yet implemented.
 | Heartbeat | `GET /api/hello` | axios/1.8.4 | YES |
 | Telemetry | `POST /api/event_logging/batch` | axios/1.8.4 | YES |
 | Datadog logs | `POST /api/v2/logs` | axios/1.8.4 | YES |
-| **Conversation API** | **POST /v1/messages** | **Bun native fetch** | **NO** |
+| **Conversation API** | **POST /v1/messages?beta=true** | **Bun native fetch** | **YES** |
 
-### What doesn't work yet
+All traffic flows through a single **HTTP Client** thread via BoringSSL
+`SSL_write`/`SSL_read`. The initial hypothesis that Bun's native `fetch()`
+used a separate TLS path was incorrect — it uses the same BoringSSL functions
+through uSockets. Earlier test captures missed `/v1/messages` due to timing
+(no new messages were submitted during the capture window).
 
-The `/v1/messages` API (prompt/response data) flows through Bun's uSockets
-TLS layer which bypasses `SSL_write`/`SSL_read`. This requires hooking
-additional functions: `ssl_on_data` (receive) and the uSockets write path.
+### Captured data includes
+
+- **Request**: Full HTTP headers (Authorization, anthropic-beta, etc.) and JSON body (model, messages array, system prompt)
+- **Response**: Complete SSE streaming events (message_start, content_block_delta with text/tool_use, message_stop)
+- **Protocol**: HTTP/1.1 over TLS (not HTTP/2)
 
 ---
 
@@ -580,54 +583,43 @@ BoringSSL hooks, suggesting the same approach would work for uSockets hooks.
 | BoringSSL pattern detection | ✅ Working |
 | sslsniff offset-based attachment | ✅ Working |
 | Telemetry/heartbeat capture | ✅ Working |
-| `/v1/messages` (prompt) capture | ❌ Not yet implemented |
+| `/v1/messages` (prompt) capture | ✅ **Working** (see Phase 9) |
 | Collector integration | ✅ `--binary-path` passed through |
 
-### What is needed to capture prompts
+### How to capture Claude traffic
 
-To capture the `/v1/messages` API traffic (prompts and responses), we need to
-hook the **uSockets TLS layer** in addition to the BoringSSL functions.
+```bash
+# Start monitoring BEFORE submitting a message to Claude:
+sudo ./bpf/sslsniff --binary-path ~/.local/share/claude/versions/2.1.39
 
-#### Key function: `ssl_on_data`
-
-- Signature: `void ssl_on_data(struct us_internal_ssl_socket_t *s, char *data, int length)`
-- Called when decrypted data is received from a TLS connection
-- Arguments: RDI=socket, **RSI=data pointer**, **EDX=length**
-- Claude binary offset: `0x3dde620`
-- **Data is available at entry time** (unlike SSL_read which needs uretprobe)
-
-#### Required eBPF changes
-
-The current probe model (save buf pointer at entry, read data at uretprobe
-exit) doesn't work for `ssl_on_data` because:
-1. It's a callback — data+length are known at entry
-2. Return type is `void` — uretprobe has no useful return value
-
-A new eBPF probe program is needed that captures data directly at entry time:
-
-```c
-// New probe needed (conceptual):
-SEC("uprobe/ssl_on_data")
-int BPF_UPROBE(probe_ssl_on_data_enter, void *socket, void *data, int length) {
-    // Read data directly here (not at exit)
-    bpf_probe_read_user(&event->buf, length, data);
-    // Submit to ring buffer immediately
-}
+# The --comm filter does NOT work because traffic comes from "HTTP Client" thread
+# Do NOT use: sudo ./bpf/sslsniff -c claude --binary-path ...
 ```
 
-#### For the write path
+All traffic (telemetry + conversation API) flows through the `HTTP Client`
+thread via BoringSSL. The capture must be running when a new message is
+submitted to capture the POST /v1/messages request and SSE response stream.
 
-Need to identify which uSockets function handles plaintext write. Candidates:
-- The function that calls `SSL_write` internally within uSockets
-- Or a higher-level uSockets send function
+### Remaining work
 
-This requires further analysis of the uSockets write data flow.
+1. ~~**Collector `--comm` filter fix**~~: **FIXED** — `collector/src/main.rs`
+   now skips passing `--comm` to sslsniff when `--binary-path` is specified.
+   The process runner still receives `--comm` for process monitoring.
+
+2. **HTTP response decompression**: Responses may use `br` (Brotli) or `gzip`
+   encoding. The collector's HTTP decompressor should handle these.
+
+3. **Large message reassembly**: Conversation context can be very large (the
+   full message history is sent with each request). The 512KB MAX_BUF_SIZE
+   in sslsniff.h may truncate large requests. Multiple SSL_write calls may
+   need to be reassembled.
 
 ### Files modified
 
 | File | Changes |
 |---|---|
 | `bpf/sslsniff.c` | Added `find_boringssl_offsets()`, `attach_openssl_by_offset()`, offset-based uprobe macros, two-stage `--binary-path` handler |
+| `collector/src/main.rs` | Fixed `--comm` filter: skip passing `-c` to sslsniff when `--binary-path` is specified (SSL traffic uses "HTTP Client" thread name, not process name) |
 | `docs/claude-code-analysis.md` | This document |
 
 ---
@@ -692,3 +684,413 @@ x-service-name: claude-code
 Telemetry payloads include: session_id, device_id, model name, event types
 (permission requests, accept/submit events, cost thresholds, Growthbook
 experiments), platform info (linux, node v24.3.0, is_running_with_bun: true).
+
+---
+
+## Phase 8: Deep Investigation of the Native Fetch TLS Path
+
+### Goal
+
+Determine exactly how Bun's native `fetch()` handles TLS encryption for the
+`/v1/messages` API, since BoringSSL `SSL_read`/`SSL_write` hooks only capture
+the axios telemetry path.
+
+### Step 1: Verify ssl_on_data is NOT the native fetch path
+
+We confirmed via disassembly that `ssl_on_data` in the Claude binary calls
+`SSL_read` at exactly our hooked offset (0x5c38e80):
+
+```
+# Profile build: ssl_on_data calls SSL_read at offset +0xA1
+40f7851: e8 0a 79 e4 01    call 5f3f160 <SSL_read>
+
+# Claude binary: same relative call at ssl_on_data + 0xA1
+03dde6c1: e8 ba a7 e5 01    → target = 0x5c38e80 ✓ (matches our hook)
+```
+
+But when traced with ftrace uprobes, `ssl_on_data` only fires from the
+**HTTP Client** thread (axios), never from the main thread:
+
+```bash
+$ sudo bash -c 'echo "p:my_ssl_on_data /path/to/claude:0x3dde620" > \
+    /sys/kernel/tracing/uprobe_events'
+$ sudo bash -c 'echo 1 > /sys/kernel/tracing/events/uprobes/my_ssl_on_data/enable'
+$ sleep 3
+
+# Result: ONLY HTTP Client thread
+HTTP Client-847297  [016] my_ssl_on_data: (0x40ef620)
+HTTP Client-847297  [016] my_ssl_on_data: (0x40ef620)
+HTTP Client-890449  [017] my_ssl_on_data: (0x40ef620)
+```
+
+### Step 2: Confirm SSL_read is only called from HTTP Client
+
+Registered a uprobe directly on SSL_read (offset 0x5c38e80) and traced for
+10 seconds during active conversation:
+
+```bash
+$ sudo bash -c 'echo "p:ssl_read_trace /path/to/claude:0x5c38e80" > \
+    /sys/kernel/tracing/uprobe_events'
+# ... enable and wait 10 seconds ...
+
+# Result: 18 calls, ALL from HTTP Client
+     18 HTTP Client
+```
+
+**No SSL_read calls from the main `claude` thread, Bun Pool threads, or
+any other thread.**
+
+### Step 3: Check for multiple copies of SSL_read
+
+Searched the entire Claude binary for the SSL_read byte-pattern prologue:
+
+```python
+pattern = bytes([0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
+                 0x53, 0x50, 0x48, 0x83, 0xbf, 0x98, 0x00, 0x00,
+                 0x00, 0x00, 0x74])
+
+# Result: Only 1 match at offset 0x5c38e80
+# There is NO second copy of SSL_read in the binary.
+```
+
+### Step 4: Find ALL callers of SSL_read and SSL_write
+
+Scanned the entire code section of the Bun profile build for `e8` (CALL)
+instructions targeting SSL_read (VA 0x5f3f160) and SSL_write (VA 0x5f3fe00):
+
+```
+=== Functions calling SSL_read (2 call sites) ===
+1. VA=0x369a330 → SSLWrapper.handleTraffic  (ssl_wrapper.zig:491)
+2. VA=0x40f7851 → ssl_on_data              (uSockets callback)
+
+=== Functions calling SSL_write (4 call sites) ===
+1. VA=0x34fa553 → http.ProxyTunnel.write              (ProxyTunnel.zig:351)
+2. VA=0x35c9308 → deps.uws.UpgradedDuplex.encodeAndWrite (UpgradedDuplex.zig:356)
+3. VA=0x3a42208 → http.websocket_client.WebSocketProxyTunnel.write
+4. VA=0x40fde0e → us_socket_write                      (uSockets C library)
+```
+
+### Step 5: Verify SSLWrapper.handleTraffic is NOT called
+
+Located `SSLWrapper.handleTraffic` in the Claude binary at file offset
+0x3390c30 (pattern-matched from profile build). Verified it also calls
+SSL_read at the correct offset. Then traced it:
+
+```bash
+$ sudo bash -c 'echo "p:ssl_wrapper_trace /path/to/claude:0x3390c30" > \
+    /sys/kernel/tracing/uprobe_events'
+# ... enabled for 10 seconds ...
+
+# Result: 0 calls. SSLWrapper.handleTraffic is NEVER invoked.
+```
+
+### Step 6: Verify BIO_s_custom_write/read are NOT used by native fetch
+
+Traced the uSockets custom BIO functions:
+
+```bash
+# BIO_s_custom_write at offset 0x3dddb60
+# BIO_s_custom_read at offset 0x3dddbb0
+
+# Result after 5 seconds:
+=== BIO_s_custom_write calls ===
+      7 HTTP Client
+=== BIO_s_custom_read calls ===
+      5 HTTP Client
+```
+
+**All BIO custom callbacks also only fire from HTTP Client thread.**
+
+### Step 7: Investigate kernel TLS (kTLS)
+
+Checked if kTLS was the mechanism bypassing SSL_read/SSL_write:
+
+```bash
+$ lsmod | grep tls
+tls    155648  26    # Module loaded!
+
+$ cat /proc/net/tls_stat
+TlsCurrTxSw    0
+TlsCurrRxSw    0
+TlsTxSw        0
+TlsRxSw        0
+# All counters are 0 → kTLS is NOT actively used
+```
+
+**kTLS ruled out.** Module is loaded but no connections use it.
+
+### Step 8: Trace network syscalls from Claude
+
+#### Main thread (TID=959023) syscalls
+
+The main Claude thread only performs:
+- `read(fd=6, count=8)` — eventfd (event loop notification)
+- `read(fd=7, count=8)` — timerfd (timer events)
+- `write(fd=13, ...)` — /dev/pts/7 (terminal output)
+- `write(fd=6, count=8)` — eventfd (signaling event loop)
+- Occasional `write(fd=18, count=0x6c7)` — socket to api.anthropic.com
+
+```
+FD 6  → anon_inode:[eventfd]     (event loop)
+FD 7  → anon_inode:[timerfd]     (timer)
+FD 8  → anon_inode:[timerfd]     (timer)
+FD 13 → /dev/pts/7               (terminal)
+FD 14 → anon_inode:[eventpoll]   (epoll)
+FD 17 → socket (api.anthropic.com:443)
+FD 18 → socket (api.anthropic.com:443)
+FD 19 → socket (api.anthropic.com:443)
+FD 25 → socket (api.anthropic.com:443)
+```
+
+**Key finding**: The main thread does NOT read from network sockets. It only
+writes to them occasionally. It spends most time on `epoll_pwait2(fd=4)`
+processing events and writing to the terminal.
+
+#### Cross-thread analysis
+
+Traced ALL write-related syscalls (`write`, `writev`, `sendmsg`, `sendto`)
+across ALL system processes for 5 seconds. Filtered for Claude threads:
+
+**No Claude thread writes to socket FDs during normal response streaming.**
+The main thread writes ONLY to terminal (fd=13) and eventfd (fd=6).
+
+### Step 9: Check for io_uring
+
+```bash
+# Traced io_uring_enter and io_uring events for 3 seconds
+# Result: NO io_uring events from Claude or any process
+```
+
+**io_uring ruled out.** Bun uses `epoll_pwait2` as its event loop.
+
+### Step 10: Investigate Bun's socket.write() source code
+
+Examined Bun's source code (v1.3.9) to understand the TLS write path:
+
+```zig
+// From src/deps/uws/socket.zig
+pub fn write(this: ThisSocket, data: []const u8) i32 {
+    return switch (this.socket) {
+        .upgradedDuplex => |socket| socket.encodeAndWrite(data),
+        .connected => |socket| socket.write(is_ssl, data),
+        .connecting, .detached => 0,
+    };
+}
+```
+
+For `.connected` SSL sockets, `socket.write(is_ssl=true, data)` delegates to
+the C-level `us_socket_write` → `SSL_write`. For `.upgradedDuplex`,
+`encodeAndWrite` also calls `SSL_write`.
+
+The Bun HTTP client uses BoringSSL through uSockets, imported as:
+```zig
+const BoringSSL = bun.BoringSSL.c;
+```
+
+### Analysis: Why don't we capture /v1/messages traffic?
+
+Despite exhaustive investigation, the BoringSSL `SSL_read`/`SSL_write`
+functions are **only called from the HTTP Client thread**. All evidence
+points to a timing/observation issue rather than a different TLS library:
+
+1. **All SSL functions (SSL_read, SSL_write, BIO_s_custom_write/read,
+   ssl_on_data)** fire exclusively from the "HTTP Client" thread
+2. **Bun's source code** confirms BoringSSL is used for all TLS, through
+   the uSockets library
+3. **Only ONE copy** of SSL_read exists in the binary
+4. **kTLS and io_uring** are not used
+5. The native fetch socket write path (`.connected` → `us_socket_write`
+   → `SSL_write`) is the same code path as axios
+
+#### Hypothesis: Connection lifecycle timing
+
+The most likely explanation is that **all TLS traffic flows through the
+HTTP Client thread**, including the `/v1/messages` API calls. The reason
+we haven't captured `/v1/messages` in test captures is:
+
+1. The API request (POST /v1/messages) is sent at the **start of each turn**
+   — before our monitoring captures begin
+2. The streaming SSE response is received quickly over the existing
+   HTTP/2 connection
+3. By the time we start tracing, the response data has already been
+   received and buffered
+4. The main thread is simply writing buffered response to the terminal
+
+To verify this, a capture must span the **exact moment** the user submits
+a new message to Claude, triggering a fresh `/v1/messages` POST request.
+
+### Process Architecture (Updated)
+
+```
+PID 959023 (claude -c --dangerously-skip-permissions)
+├── TID 959023  claude          ← Main thread: JS execution, terminal I/O, epoll
+├── TID 959024  claude          ← Secondary event loop
+├── TID 959025-959031  HeapHelper (7) ← GC threads
+├── TID 959035  HTTP Client     ← ALL SSL/TLS traffic (axios + native fetch?)
+├── TID 959036-959625  Bun Pool 0-11 (12) ← Worker threads
+├── TID 959061  File Watcher    ← FS monitoring
+├── TID 994361+ JITWorker (3)   ← JIT compilation
+└── TID 997844  t Helper Thread ← Unknown
+
+Also running:
+PID 890428 (claude) — background process, 18 threads, 3 API connections
+PID 302782, 313517 — Node.js-based Claude processes (no API connections)
+PID 269932, 845341, 894340 — Other sessions
+```
+
+### Summary of all BoringSSL functions traced
+
+| Function | Offset (Claude) | Called from | Purpose |
+|---|---|---|---|
+| SSL_read | 0x5c38e80 | HTTP Client only | Read decrypted data |
+| SSL_write | 0x5c39b20 | HTTP Client only | Write data for encryption |
+| SSL_do_handshake | 0x5c38790 | (not traced) | TLS handshake |
+| ssl_on_data | 0x3dde620 | HTTP Client only | uSockets data callback |
+| ssl_on_writable | 0x3dde900 | (not traced) | uSockets writable callback |
+| BIO_s_custom_write | 0x3dddb60 | HTTP Client only | Custom BIO write |
+| BIO_s_custom_read | 0x3dddbb0 | HTTP Client only | Custom BIO read |
+| SSLWrapper.handleTraffic | 0x3390c30 | NEVER called | Zig SSL wrapper (unused?) |
+
+### Next steps
+
+1. **Long-running capture spanning message submission**: Run sslsniff
+   continuously while a user submits a new message to Claude, to capture
+   the initial POST /v1/messages request and streaming response
+2. **HTTP/2 frame decoding**: The /v1/messages traffic may use HTTP/2
+   over a persistent connection. Captured data would be binary HTTP/2
+   frames, not plaintext HTTP/1.1. Need HTTP/2 frame parser to extract
+   the actual request/response data
+3. **Alternative: Hook at the Zig/JS layer**: Instead of hooking at the
+   BoringSSL level, hook higher-level Bun functions that handle HTTP
+   request/response data before/after TLS encryption
+
+---
+
+## Phase 9: Breakthrough — Full /v1/messages Capture
+
+### Goal
+
+Resolve the mystery of why `/v1/messages` traffic was never captured despite
+all evidence pointing to BoringSSL as the only TLS implementation.
+
+### Key Insight: Timing Was the Issue
+
+The Phase 8 investigation conclusively proved that **all TLS traffic** flows
+through the HTTP Client thread via BoringSSL `SSL_write`/`SSL_read`. The reason
+previous captures missed `/v1/messages` was simple: **no new messages were
+submitted during the capture window**.
+
+The `/v1/messages` POST request is sent at the start of each conversation turn.
+If sslsniff starts after the request has already been sent, and the SSE
+streaming response completes before the next capture check, the traffic is missed.
+
+### Experiment: Self-referential capture
+
+Since this analysis is being performed by a Claude Code instance (PID 959023),
+the act of making tool calls generates `/v1/messages` API traffic. By starting
+sslsniff **before** making more tool calls, we can capture our own API traffic.
+
+```bash
+# Start sslsniff in background
+$ sudo ./bpf/sslsniff --binary-path ~/.local/share/claude/versions/2.1.39 \
+    2>/tmp/sslsniff_stderr.log > /tmp/sslsniff_capture.log &
+
+# sslsniff attaches successfully:
+# "BoringSSL detected! Attaching by offset..."
+
+# Then continue making tool calls (which generates API traffic)
+# After ~30 seconds, analyze the capture:
+```
+
+### Results: Complete capture of ALL traffic
+
+```
+Total events captured: 3,088 lines
+├── HTTP Client(pid=959023): 2,985 events  (this session)
+└── HTTP Client(pid=996386): 103 events    (other Claude process)
+
+Functions:
+├── READ/RECV: 3,043 events (SSE streaming responses)
+└── WRITE/SEND: 45 events (requests + telemetry)
+
+HTTP Endpoints captured:
+├── POST /v1/messages?beta=true: 12 requests  ← CONVERSATION API!
+├── POST /api/event_logging/batch: 5 requests
+├── POST /api/v2/logs: 2 requests
+└── GET /api/hello: 2 requests
+
+SSE response events: 2,072 (content_block_delta, message_start, etc.)
+```
+
+### Captured request details
+
+Full HTTP/1.1 request with all headers and JSON body:
+
+```
+POST /v1/messages?beta=true HTTP/1.1
+Accept: application/json
+Authorization: Bearer sk-ant-oat01-...
+Content-Type: application/json
+User-Agent: claude-cli/2.1.39 (external, cli)
+X-Stainless-Arch: x64
+X-Stainless-Lang: js
+X-Stainless-OS: Linux
+X-Stainless-Package-Version: 0.73.0
+X-Stainless-Runtime: node
+X-Stainless-Runtime-Version: v24.3.0
+X-Stainless-Timeout: 600
+anthropic-beta: oauth-2025-04-20,interleaved-thinking-2025-05-14,...
+anthropic-version: 2023-06-01
+x-app: cli
+Host: api.anthropic.com
+Accept-Encoding: gzip, deflate, br, zstd
+
+{"model":"claude-haiku-4-5-20251001","messages":[...full conversation...],...}
+```
+
+### Captured SSE streaming response
+
+```
+event: message_start
+data: {"type":"message_start","message":{"model":"claude-haiku-4-5-20251001",
+  "id":"msg_01LUTkpAXp558VX17nfxzG3x","usage":{"input_tokens":390,...}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text",...}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta",
+  "text":"..."}}
+```
+
+### Why Phase 7 / Phase 8 were misleading
+
+The original Phase 7 hypothesis was that Bun uses two separate TLS paths:
+1. `axios` → BoringSSL SSL_write/SSL_read (captured)
+2. `fetch()` → uSockets with different TLS path (not captured)
+
+This was **incorrect**. Both paths use the same BoringSSL functions through
+the same HTTP Client thread. The confusion arose because:
+
+1. **Timing**: Previous test captures ran for 60 seconds but during that window
+   no new `/v1/messages` POST requests were made. The response streaming had
+   already completed before sslsniff started.
+2. **Thread naming**: The `HTTP Client` thread handles ALL HTTP traffic, not
+   just axios. Bun's native fetch also dispatches through this thread.
+3. **uSockets**: The ssl_on_data / us_socket_write functions are intermediate
+   layers that ultimately call SSL_read/SSL_write, which our hooks capture.
+
+### Architecture correction
+
+```
+BEFORE (incorrect hypothesis):
+  axios    → BoringSSL SSL_write/SSL_read → HTTP Client thread  (captured ✓)
+  fetch()  → uSockets custom TLS path    → Main thread          (not captured ✗)
+
+AFTER (correct architecture):
+  axios    → Node.js http → BoringSSL SSL_write/SSL_read → HTTP Client  (captured ✓)
+  fetch()  → uSockets     → BoringSSL SSL_write/SSL_read → HTTP Client  (captured ✓)
+```
+
+Both code paths converge at the same BoringSSL functions on the HTTP Client
+thread. No additional hooks are needed.

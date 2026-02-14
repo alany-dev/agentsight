@@ -482,8 +482,14 @@ async fn run_trace(
         if let Some(uid_filter) = ssl_uid {
             ssl_args.extend(["-u".to_string(), uid_filter.to_string()]);
         }
-        if let Some(comm_filter) = comm {
-            ssl_args.extend(["-c".to_string(), comm_filter.to_string()]);
+        // Note: when --binary-path is specified, we skip the --comm filter for sslsniff
+        // because SSL traffic comes from "HTTP Client" thread (not the process name).
+        // bpf_get_current_comm() returns thread name, so -c <process-name> would filter
+        // out all SSL traffic. Instead, --binary-path alone provides sufficient targeting.
+        if binary_path.is_none() {
+            if let Some(comm_filter) = comm {
+                ssl_args.extend(["-c".to_string(), comm_filter.to_string()]);
+            }
         }
         if ssl_handshake {
             ssl_args.push("--handshake".to_string());
