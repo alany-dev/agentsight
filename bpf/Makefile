@@ -20,7 +20,7 @@ VMLINUX := ../vmlinux/$(ARCH)/vmlinux.h
 # Use our own libbpf API headers and Linux UAPI headers distributed with
 # libbpf to avoid dependency on system-wide headers, which could be missing or
 # outdated
-INCLUDES := -I$(OUTPUT) -I../libbpf/include/uapi -I$(dir $(VMLINUX))
+INCLUDES := -I$(OUTPUT) -I. -I../libbpf/include/uapi -I$(dir $(VMLINUX))
 CFLAGS := -g -Wall
 ALL_LDFLAGS := $(LDFLAGS) $(EXTRA_LDFLAGS)
 
@@ -31,7 +31,10 @@ CFLAGS += $(ASAN_FLAGS)
 ALL_LDFLAGS += $(ASAN_FLAGS)
 endif
 
-APPS = sslsniff process test_process_utils test_process_filter # minimal minimal_legacy uprobe kprobe fentry usdt sockfilter tc ksyscall
+APPS = sslsniff process process_new test_process_utils test_process_filter test_process_new_map_flush test_process_new_mem_info test_process_new_header # minimal minimal_legacy uprobe kprobe fentry usdt sockfilter tc ksyscall
+
+# All test programs (no BPF skeleton needed)
+TEST_APPS = test_process_utils test_process_filter test_process_new_map_flush test_process_new_mem_info test_process_new_header
 
 CARGO ?= $(shell which cargo)
 ifeq ($(strip $(CARGO)),)
@@ -106,12 +109,26 @@ help:
 	@echo "  make ASAN=1 sslsniff"
 
 .PHONY: test
-test: test_process_utils test_process_filter
+test: test_process_utils test_process_filter test_process_new_map_flush test_process_new_mem_info test_process_new_header
 	@echo "Running process_utils tests..."
 	@./test_process_utils
 	@echo ""
 	@echo "Running process_filter tests..."
 	@./test_process_filter
+	@echo ""
+	@echo "Running process_new map_flush tests..."
+	@./test_process_new_map_flush
+	@echo ""
+	@echo "Running process_new mem_info tests..."
+	@./test_process_new_mem_info
+	@echo ""
+	@echo "Running process_new header tests..."
+	@./test_process_new_header
+
+.PHONY: integration-test
+integration-test: process_new process
+	@echo "Running integration tests (requires sudo)..."
+	@sudo python3 tests/test_integration.py
 
 $(OUTPUT) $(OUTPUT)/libbpf $(BPFTOOL_OUTPUT):
 	$(call msg,MKDIR,$@)
@@ -142,6 +159,9 @@ $(LIBBLAZESYM_HEADER): $(LIBBLAZESYM_SRC)/target/release/libblazesym.a | $(OUTPU
 	$(call msg,LIB,$@)
 	$(Q)cp $(LIBBLAZESYM_SRC)/target/release/blazesym.h $@
 
+# Extra dependencies for process_new BPF (subdirectory headers)
+$(OUTPUT)/process_new.bpf.o: $(wildcard process_ext/*.h)
+
 # Build BPF code
 $(OUTPUT)/%.bpf.o: %.bpf.c $(LIBBPF_OBJ) $(wildcard %.h) $(VMLINUX) | $(OUTPUT) $(BPFTOOL)
 	$(call msg,BPF,$@)
@@ -155,8 +175,8 @@ $(OUTPUT)/%.skel.h: $(OUTPUT)/%.bpf.o | $(OUTPUT) $(BPFTOOL)
 	$(call msg,GEN-SKEL,$@)
 	$(Q)$(BPFTOOL) gen skeleton $< > $@
 
-# Build user-space code
-$(patsubst %,$(OUTPUT)/%.o,$(filter-out test_process_utils test_process_filter,$(APPS))): %.o: %.skel.h
+# Build user-space code (exclude all test programs from the skel.h requirement)
+$(patsubst %,$(OUTPUT)/%.o,$(filter-out $(TEST_APPS),$(APPS))): %.o: %.skel.h
 
 # Special rule for test programs (no BPF skeleton needed)
 $(OUTPUT)/test_process_utils.o: test_process_utils.c $(wildcard *.h) | $(OUTPUT)
@@ -167,6 +187,18 @@ $(OUTPUT)/test_process_filter.o: test_process_filter.c $(wildcard *.h) | $(OUTPU
 	$(call msg,CC,$@)
 	$(Q)$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
+$(OUTPUT)/test_process_new_map_flush.o: tests/test_process_new_map_flush.c $(wildcard *.h) $(wildcard process_ext/*.h) | $(OUTPUT)
+	$(call msg,CC,$@)
+	$(Q)$(CC) $(CFLAGS) -I. -Itests -c $< -o $@
+
+$(OUTPUT)/test_process_new_mem_info.o: tests/test_process_new_mem_info.c $(wildcard *.h) $(wildcard process_ext/*.h) | $(OUTPUT)
+	$(call msg,CC,$@)
+	$(Q)$(CC) $(CFLAGS) -I. -c $< -o $@
+
+$(OUTPUT)/test_process_new_header.o: tests/test_process_new_header.c $(wildcard *.h) $(wildcard process_ext/*.h) | $(OUTPUT)
+	$(call msg,CC,$@)
+	$(Q)$(CC) $(CFLAGS) -I. -c $< -o $@
+
 $(OUTPUT)/%.o: %.c $(wildcard %.h) | $(OUTPUT)
 	$(call msg,CC,$@)
 	$(Q)$(CC) $(CFLAGS) $(INCLUDES) -c $(filter %.c,$^) -o $@
@@ -175,8 +207,8 @@ $(patsubst %,$(OUTPUT)/%.o,$(BZS_APPS)): $(LIBBLAZESYM_HEADER)
 
 $(BZS_APPS): $(LIBBLAZESYM_OBJ)
 
-# Build application binary
-$(filter-out test_process_utils test_process_filter,$(APPS)): %: $(OUTPUT)/%.o $(LIBBPF_OBJ) | $(OUTPUT)
+# Build application binary (exclude all test programs)
+$(filter-out $(TEST_APPS),$(APPS)): %: $(OUTPUT)/%.o $(LIBBPF_OBJ) | $(OUTPUT)
 	$(call msg,BINARY,$@)
 	$(Q)$(CC) $(CFLAGS) $^ $(ALL_LDFLAGS) -lelf -lz -o $@
 
@@ -186,6 +218,18 @@ test_process_utils: $(OUTPUT)/test_process_utils.o | $(OUTPUT)
 	$(Q)$(CC) $(CFLAGS) $^ $(ALL_LDFLAGS) -o $@
 
 test_process_filter: $(OUTPUT)/test_process_filter.o | $(OUTPUT)
+	$(call msg,BINARY,$@)
+	$(Q)$(CC) $(CFLAGS) $^ $(ALL_LDFLAGS) -o $@
+
+test_process_new_map_flush: $(OUTPUT)/test_process_new_map_flush.o | $(OUTPUT)
+	$(call msg,BINARY,$@)
+	$(Q)$(CC) $(CFLAGS) $^ $(ALL_LDFLAGS) -o $@
+
+test_process_new_mem_info: $(OUTPUT)/test_process_new_mem_info.o | $(OUTPUT)
+	$(call msg,BINARY,$@)
+	$(Q)$(CC) $(CFLAGS) $^ $(ALL_LDFLAGS) -o $@
+
+test_process_new_header: $(OUTPUT)/test_process_new_header.o | $(OUTPUT)
 	$(call msg,BINARY,$@)
 	$(Q)$(CC) $(CFLAGS) $^ $(ALL_LDFLAGS) -o $@
 

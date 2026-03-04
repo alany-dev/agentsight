@@ -2,29 +2,39 @@
 
 ## 硬性约束（实现时必须遵守）
 
-1. **现有 JSON 输出格式不可变**——EXEC/EXIT/FILE_OPEN/BASH_READLINE 的字段名、字段顺序、值类型必须与当前 process.c 输出完全一致。任何消费者（Rust collector、分析脚本）不应因升级而 break。
-2. **新增 SUMMARY 事件必须遵循现有字段约定**：
+1. **现有文件不修改**——`process.bpf.c`、`process.c`、`process.h`、`process_utils.h`、`process_filter.h` 完全不动。新功能通过独立的 `process_new` 程序实现
+2. **现有 JSON 输出格式不可变**——EXEC/EXIT/FILE_OPEN/BASH_READLINE 的字段名、字段顺序、值类型必须与当前 process.c 输出完全一致。任何消费者（Rust collector、分析脚本）不应因升级而 break
+3. **新增 SUMMARY 事件必须遵循现有字段约定**：
    - 字段顺序：`timestamp`（纳秒）→ `event` → `comm` → `pid` → 类型特定字段
    - `timestamp` 使用 `bpf_ktime_get_ns()` 纳秒值（与现有事件一致），不是秒或毫秒
    - `event` 字段统一为 `"SUMMARY"`，用 `type` 子字段区分具体事件类型
-3. **不加新 flag 时行为完全不变**——默认不启用任何新追踪，性能、输出、CLI 行为与当前版本相同
-4. **struct event 不变**——新事件不使用 struct event 结构体，不经过 ring buffer
+4. **process_new 默认行为与 process 完全一致**——不加新 flag 时，输出、性能、CLI 行为相同
+5. **struct event 不变**——新事件不使用 struct event 结构体，不经过 ring buffer
+6. **新增头文件统一放 `bpf/process_ext/` 子目录**——不污染 `bpf/` 顶层目录（注：最初设计为 `process_new/`，因与二进制同名冲突已改为 `process_ext/`）
 
 ## 背景
 
 Branch context 论文需要证明 AI agent 的探索路径会产生**多维状态副作用**（文件系统、网络、进程、环境），而现有机制无法统一回滚。AgentSight 现有的 `process` tracer 只追踪了文件打开和进程生命周期，缺少文件删除/重命名、网络端口、进程组变更等关键数据。
 
-**方案**：直接扩展现有 `process` tracer，通过特性开关（feature flags）按需启用新追踪能力。保持 CLI 接口和 JSON 输出格式向后兼容。
+**方案**：新建独立的 `process_new` 程序（`process_new.bpf.c` + `process_new.c`），复用现有 `process` 的核心逻辑（ring buffer 事件、PID 过滤等），新增 BPF map 聚合能力。现有 `process.bpf.c` / `process.c` **完全不动**，避免引入回归 bug。
 
-## 为什么合并而非独立 tracer
+### 开发策略约束
 
-| | 合并到 process | 独立 workspace tracer |
+1. **现有 `process.bpf.c` 和 `process.c` 不修改**——确保已有功能零回归风险
+2. **`process_new` 是独立的编译目标**——`make process_new` 单独构建，不影响 `make process`
+3. **新增头文件统一放在 `bpf/process_ext/` 子目录**——BPF 侧和用户空间侧的模块化头文件集中管理，不污染 `bpf/` 顶层
+4. **`process_new` 复制必要的现有代码**——不通过 `#include "process.bpf.c"` 复用，而是直接复制 handle_exec/handle_exit 等 handler + 需要的工具函数。代价是少量代码重复，换来两个程序完全解耦
+5. **未来合并可选**——当 `process_new` 稳定后，可以考虑替换 `process`，但不是必须的
+
+### 为什么不改现有文件
+
+| | 修改现有 process | 新建 process_new |
 |---|---|---|
-| PID 过滤 | ✅ 复用现有 pid_tracker，一处过滤 | ❌ 需要重新实现一套过滤 |
-| Ring buffer | ✅ 单个 buffer，事件有序 | ❌ 两个 buffer，需要在用户空间合并排序 |
-| 进程管理 | ✅ 一个进程 | ❌ 两个进程需协调启停 |
-| 代码复用 | ✅ 复用 event 结构、dedup、rate limit | ❌ 重复实现 |
-| 向后兼容 | ✅ 默认不启用新特性=完全相同行为 | ✅ 独立二进制不影响 |
+| 回归风险 | ❌ 高——改动 process.bpf.c 700+ 行可能引入 bug | ✅ 零——现有代码不动 |
+| 调试难度 | ❌ 新旧逻辑交织 | ✅ 新代码独立，bug 定位简单 |
+| 渐进开发 | ❌ 每步都要保证不破坏现有行为 | ✅ 新程序可以自由迭代 |
+| 代码重复 | ✅ 无重复 | ❌ 少量重复（handle_exec 等基础 handler） |
+| 构建/测试 | ❌ 共用一个目标，改动牵一发动全身 | ✅ 独立目标，互不影响 |
 
 ## 当前 process tracer 的能力
 
@@ -170,7 +180,7 @@ struct {
 在 BPF 侧用 `const volatile` 变量控制，JIT 编译后禁用的分支直接被优化掉：
 
 ```c
-// process.bpf.c 新增
+// process_new.bpf.c
 const volatile bool trace_fs_mutations = false;   // --trace-fs
 const volatile bool trace_network = false;         // --trace-net
 const volatile bool trace_signals = false;         // --trace-signals
@@ -189,7 +199,7 @@ int trace_unlinkat(struct trace_event_raw_sys_enter *ctx)
 用户空间在 load skeleton 后、attach 前设置：
 
 ```c
-// process.c
+// process_new.c
 skel->rodata->trace_fs_mutations = env.trace_fs;
 skel->rodata->trace_network = env.trace_net;
 skel->rodata->trace_signals = env.trace_signals;
@@ -205,7 +215,7 @@ skel->rodata->trace_memory = env.trace_mem;
 **方案**：新增一个 BPF hash map `tracked_pids`，用户空间在检测到新进程（EXEC 事件）时将 pid 写入 map；进程退出时删除。所有新 BPF handler 在聚合前先查这个 map：
 
 ```c
-// process.bpf.c
+// process_new.bpf.c
 const volatile bool filter_pids = false;  // 仅在 -c/-p 模式下启用
 
 struct {
@@ -223,7 +233,7 @@ static __always_inline bool is_pid_tracked(void)
 }
 ```
 
-**用户空间维护**（process.c handle_event）：
+**用户空间维护**（process_new.c handle_event）：
 
 ```c
 case EVENT_TYPE_PROCESS:
@@ -331,7 +341,7 @@ int trace_unlinkat(struct trace_event_raw_sys_enter *ctx) {
 在 BPF 中提取路径的父目录前缀（截断到最后一个 `/`）。BPF verifier 要求固定上界循环：
 
 ```c
-// process_bpf_fs.h
+// process_ext/bpf_fs.h
 static __always_inline void extract_dir_prefix(const char *path, char *out, int out_len)
 {
     int last_slash = 0;
@@ -360,7 +370,7 @@ static __always_inline void extract_dir_prefix(const char *path, char *out, int 
 所有新事件共用一个聚合更新逻辑，抽为 BPF inline helper：
 
 ```c
-// process_bpf_common.h
+// process_ext/bpf_common.h
 static __always_inline void update_agg_map(struct agg_key *key, u64 count, u64 bytes)
 {
     struct agg_value *val = bpf_map_lookup_elem(&event_agg_map, key);
@@ -411,7 +421,7 @@ int trace_mmap(struct trace_event_raw_sys_enter *ctx) {
 用于论文实验 3.6：精确度量 fork 后 CoW 的触发频率和开销。
 
 ```c
-// process_bpf_cow.h
+// process_ext/bpf_cow.h
 // kprobe 挂在 do_wp_page（CoW 核心路径）上，按 pid 聚合 minor fault 计数
 
 SEC("kprobe/do_wp_page")
@@ -446,7 +456,7 @@ int trace_cow_fault(struct pt_regs *ctx) {
 在 `handle_event()` 中，对 EXEC/EXIT 事件额外读 `/proc/<pid>/statm` 和 `/proc/<pid>/status`：
 
 ```c
-// process_mem_info.h — 用户空间 header-only
+// process_ext/mem_info.h — 用户空间 header-only
 
 struct proc_mem_info {
     long rss_pages;      // /proc/pid/statm field 1
@@ -531,7 +541,7 @@ case EVENT_TYPE_PROCESS:
 所有新增事件共用一套聚合结构：
 
 ```c
-// process.h 新增
+// process_new.h（新增文件，#include "process.h" 后扩展）
 
 #define DETAIL_LEN 64
 
@@ -573,7 +583,7 @@ enum event_type {
 };
 ```
 
-**BPF map 定义**（process.bpf.c）：
+**BPF map 定义**（process_new.bpf.c）：
 
 ```c
 /* 统一聚合 map：所有新增事件的唯一聚合目标 */
@@ -639,16 +649,16 @@ if (bpf_map_update_elem(&event_agg_map, key, &new_val, BPF_NOEXIST) < 0) {
 
 ## CLI 接口变更
 
-### 现有（保持不变）
+### 现有 process（完全不变）
 
 ```
 ./process [-v] [-d MS] [-c COMMANDS] [-p PID] [-m MODE]
 ```
 
-### 新增 flags（纯追加）
+### 新程序 process_new（兼容现有参数 + 新增 flags）
 
 ```
-./process [...现有参数...] [--trace-fs] [--trace-net] [--trace-signals] [--trace-all]
+./process_new [-v] [-d MS] [-c COMMANDS] [-p PID] [-m MODE] [--trace-fs] [--trace-net] [--trace-signals] [--trace-all]
 ```
 
 | Flag | 启用的追踪 | 默认 |
@@ -729,7 +739,7 @@ let runner = ProcessRunner::from_binary_extractor(path)
 现有 event loop 使用 `ring_buffer__poll(rb, -1)` 无限阻塞。改为带超时的轮询 + 定时 flush：
 
 ```c
-// process.c — 主循环改造
+// process_new.c — 主循环
 #define POLL_TIMEOUT_MS  1000   // ring buffer poll 超时 1 秒
 #define FLUSH_INTERVAL_S 5      // BPF map flush 间隔 5 秒
 
@@ -756,7 +766,7 @@ flush_agg_map(skel->maps.event_agg_map);
 ### flush_agg_map 实现
 
 ```c
-// process_map_flush.h
+// process_ext/map_flush.h
 
 static void flush_agg_map(int map_fd)
 {
@@ -800,7 +810,7 @@ case EVENT_TYPE_PROCESS:
 ```
 
 ```c
-// process_map_flush.h
+// process_ext/map_flush.h
 static void flush_pid_from_agg_map(int map_fd, u32 target_pid)
 {
     struct agg_key key = {}, next_key;
@@ -829,61 +839,70 @@ static void flush_pid_from_agg_map(int map_fd, u32 target_pid)
 
 **注意**：`bpf_map_get_next_key` 遍历整个 map 来找特定 pid 的条目，复杂度 O(map_size)。对 16384 条目的 map 这是可接受的（<1ms）。如果 map 很大，可以维护一个 per-pid 的 key 索引（用户空间 hash map）来加速。
 
-## 代码组织：header-only 模块化
+## 代码组织：独立 process_new + 子目录模块化
 
-现有 `process.c` 已超过 700 行，继续往里加会不好维护。重构为 header-only 库的模块化结构：
+现有 `process.bpf.c` 和 `process.c` **完全不动**。新建 `process_new.bpf.c` + `process_new.c` 作为独立编译目标，所有新增头文件放在 `bpf/process_ext/` 子目录中（注：最初设计为 `process_new/`，因与二进制文件同名冲突已重命名为 `process_ext/`）：
 
 ```
 bpf/
 │
-├── process.h                      ← 共享事件结构 + enum（BPF + 用户空间都用）
+├── process.h                          ← 现有，不修改
+├── process.bpf.c                      ← 现有，不修改
+├── process.c                          ← 现有，不修改
+├── process_utils.h                    ← 现有，不修改
+├── process_filter.h                   ← 现有，不修改
 │
-├── ===== BPF 内核侧 =====
-├── process.bpf.c                  ← 主 BPF 程序：#include 各模块，定义 maps + feature flags
-├── process_bpf_common.h           ← BPF header-only：is_pid_tracked() + update_agg_map() 通用辅助
-├── process_bpf_fs.h               ← BPF header-only：文件系统 tracepoints（unlinkat, renameat2, mkdirat, ftruncate, chdir）+ extract_dir_prefix()
-├── process_bpf_write.h            ← BPF header-only：write enter/exit handlers + write_fd_map（临时上下文）
-├── process_bpf_net.h              ← BPF header-only：网络 tracepoints（bind, listen, connect + sockaddr 解析）
-├── process_bpf_signals.h          ← BPF header-only：进程协调 tracepoints（setpgid, setsid, kill, fork）
-├── process_bpf_mem.h              ← BPF header-only：内存 tracepoints（mmap MAP_SHARED 过滤）
-├── process_bpf_cow.h              ← BPF header-only：CoW page fault 追踪（kprobe/do_wp_page）
+├── process_new.h                      ← 新增：扩展事件结构（agg_key/agg_value/新 event_type enum）
+├── process_new.bpf.c                  ← 新增：BPF 胶水文件（定义 maps + flags + #include 子目录模块）
+├── process_new.c                      ← 新增：用户空间主程序（CLI + flush 循环 + handle_event）
 │
-├── ===== 用户空间 =====
-├── process.c                      ← 主程序：main() + CLI 解析 + flush 循环（不再无限阻塞 poll）
-├── process_utils.h                ← 现有：/proc 读取工具函数
-├── process_filter.h               ← 现有：PID 过滤器
-├── process_output.h               ← 新增：JSON 输出函数（每种事件类型一个 print 函数）
-├── process_dedup.h                ← 重构：现有 FILE_OPEN dedup 逻辑抽出（仍用用户空间 dedup，因为 FILE_OPEN 是现有行为不改）
-├── process_map_flush.h            ← 新增：统一 event_agg_map flush + fd→path 解析 + per-pid flush
-├── process_net_fmt.h              ← 新增：sockaddr 格式化（IP/port 字符串转换）
-├── process_mem_info.h             ← 新增：per-process 内存采集（读 /proc/pid/statm + status）
+├── process_ext/                       ← 新增子目录：所有模块化头文件
+│   │
+│   ├── ===== BPF 内核侧 =====
+│   ├── bpf_common.h                   ← is_pid_tracked() + update_agg_map() + format_fd_detail() + format_ipv4_port()
+│   ├── bpf_fs.h                       ← 文件系统 tracepoints（unlinkat, renameat2, mkdirat, ftruncate, chdir）+ extract_dir_prefix()
+│   ├── bpf_write.h                    ← write enter/exit handlers + write_fd_map（临时上下文）
+│   ├── bpf_net.h                      ← 网络 tracepoints（bind, listen, connect + sockaddr 解析 + format_family()）
+│   ├── bpf_signals.h                  ← 进程协调 tracepoints（setpgid, setsid, kill, fork）+ write_uint/write_int/write_str
+│   ├── bpf_mem.h                      ← 内存 tracepoints（mmap MAP_SHARED 过滤）
+│   ├── bpf_cow.h                      ← CoW page fault 追踪（kprobe/do_wp_page）
+│   │
+│   ├── ===== 用户空间 =====
+│   ├── map_flush.h                    ← event_type_name() + json_escape() + print_summary_json() + flush_agg_map() + flush_pid_from_agg_map() + check_overflow()
+│   └── mem_info.h                     ← read_proc_mem_info()：读 /proc/pid/statm + /proc/pid/status
 │
 └── tests/
-    ├── test_process_utils.c       ← 现有（移入）
-    ├── test_process_filter.c      ← 现有（移入）
-    ├── test_process_output.c      ← 新增：JSON 输出格式
-    ├── test_process_dedup.c       ← 新增：FILE_OPEN dedup（现有逻辑的独立测试）
-    ├── test_process_net.c         ← 新增：sockaddr 解析（AF_INET/AF_INET6/AF_UNIX）
-    └── test_process_map_flush.c   ← 新增：BPF map flush 逻辑 + fd→path
+    ├── test_process_utils.c           ← 现有，不修改
+    ├── test_process_filter.c          ← 现有，不修改
+    ├── test_process_new_header.c      ← 新增：结构体布局、枚举值、常量（49 tests）
+    ├── test_process_new_map_flush.c   ← 新增：event_type_name, json_escape, print_summary_json（48 tests）
+    ├── test_process_new_mem_info.c    ← 新增：/proc 内存信息读取（18 tests）
+    ├── test_integration.sh            ← 新增：eBPF 加载集成测试（19 test cases，需 sudo + jq）
+    └── bpf/                           ← 测试用 libbpf stub 头文件
+        ├── bpf.h
+        └── libbpf.h
 ```
 
 **BPF 侧模块化说明**：
 
-`process.bpf.c` 变成一个"胶水"文件，只定义共享资源 + include 各模块：
+`process_new.bpf.c` 是独立的胶水文件，定义所有资源 + include 子目录模块：
 
 ```c
-// process.bpf.c — 精简为胶水文件
+// process_new.bpf.c — 独立新程序，不修改现有 process.bpf.c
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
-#include "process.h"
+#include "process.h"        // 复用现有 struct event（ring buffer 事件）
+#include "process_new.h"    // 新增 agg_key/agg_value/新 event_type
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
-/* === 共享资源 === */
+/* === 共享资源（ring buffer 用于现有事件） === */
 struct { __uint(type, BPF_MAP_TYPE_RINGBUF); __uint(max_entries, 256 * 1024); } rb SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 8192); __type(key, pid_t); __type(value, u64); } exec_start SEC(".maps");
+
+/* === 新增资源（BPF map 聚合用于新事件） === */
 struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 16384); __type(key, struct agg_key); __type(value, struct agg_value); } event_agg_map SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, MAX_TRACKED_PIDS); __type(key, u32); __type(value, u8); } tracked_pids SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY); __uint(max_entries, 1); __type(key, u32); __type(value, u64); } agg_overflow_count SEC(".maps");
@@ -897,29 +916,29 @@ const volatile bool trace_memory = false;
 const volatile bool trace_cow = false;
 
 /* === 通用辅助（必须在所有模块之前） === */
-#include "process_bpf_common.h"    // is_pid_tracked() + update_agg_map()
+#include "process_ext/bpf_common.h"    // is_pid_tracked() + update_agg_map()
 
-/* === 现有 handlers（保留在此文件，或也可抽出） === */
+/* === 现有 handlers（从 process.bpf.c 复制） === */
 // handle_exec, handle_exit, trace_openat, trace_open, bash_readline
-// ... 现有代码 ...
+// 注意：直接复制而非 #include，确保两个程序完全解耦
 
 /* === 新增模块（全部使用 event_agg_map + is_pid_tracked） === */
-#include "process_bpf_fs.h"        // unlinkat, renameat2, mkdirat, ftruncate, chdir
-#include "process_bpf_write.h"     // write enter/exit（write_fd_map 为临时上下文，聚合到 event_agg_map）
-#include "process_bpf_net.h"       // bind, listen, connect
-#include "process_bpf_signals.h"   // setpgid, setsid, kill, fork
-#include "process_bpf_mem.h"       // mmap (MAP_SHARED only)
-#include "process_bpf_cow.h"       // CoW page fault (kprobe/do_wp_page)
+#include "process_ext/bpf_fs.h"        // unlinkat, renameat2, mkdirat, ftruncate, chdir
+#include "process_ext/bpf_write.h"     // write enter/exit（write_fd_map 为临时上下文，聚合到 event_agg_map）
+#include "process_ext/bpf_net.h"       // bind, listen, connect
+#include "process_ext/bpf_signals.h"   // setpgid, setsid, kill, fork
+#include "process_ext/bpf_mem.h"       // mmap (MAP_SHARED only)
+#include "process_ext/bpf_cow.h"       // CoW page fault (kprobe/do_wp_page)
 ```
 
 每个 BPF header-only 模块的结构一致：
 
 ```c
-// process_bpf_fs.h — 文件系统 mutations
-#ifndef __PROCESS_BPF_FS_H
-#define __PROCESS_BPF_FS_H
+// process_ext/bpf_fs.h — 文件系统 mutations
+#ifndef __PROCESS_NEW_BPF_FS_H
+#define __PROCESS_NEW_BPF_FS_H
 
-// 引用 process.bpf.c 中定义的共享资源（extern 不需要，BPF 同一编译单元）
+// 引用 process_new.bpf.c 中定义的共享资源（extern 不需要，BPF 同一编译单元）
 
 SEC("tp/syscalls/sys_enter_unlinkat")
 int trace_unlinkat(struct trace_event_raw_sys_enter *ctx)
@@ -935,231 +954,320 @@ int trace_renameat2(struct trace_event_raw_sys_enter *ctx)
     // ...
 }
 
-SEC("tp/syscalls/sys_enter_mkdirat")
-int trace_mkdirat(struct trace_event_raw_sys_enter *ctx)
-{
-    if (!trace_fs_mutations) return 0;
-    // ...
-}
+// ... mkdirat, ftruncate, chdir 同理 ...
 
-SEC("tp/syscalls/sys_enter_ftruncate")
-int trace_ftruncate(struct trace_event_raw_sys_enter *ctx)
-{
-    if (!trace_fs_mutations) return 0;
-    // ...
-}
-
-SEC("tp/syscalls/sys_enter_chdir")
-int trace_chdir(struct trace_event_raw_sys_enter *ctx)
-{
-    if (!trace_fs_mutations) return 0;
-    // ...
-}
-
-#endif /* __PROCESS_BPF_FS_H */
+#endif /* __PROCESS_NEW_BPF_FS_H */
 ```
 
 **好处**：
+- **零回归风险**：现有 `process` 完全不动，`make process` 结果不变
 - 每个模块独立可读（~50-80 行），不用在一个 500+ 行的 .bpf.c 里翻找
 - BPF 编译器看到的仍是单个编译单元（通过 #include），maps 和 flags 自然共享
+- 子目录 `process_ext/` 集中管理，不污染 `bpf/` 顶层
 - 可以按模块 review、按模块 disable（注释掉一行 #include）
 
-**重构原则**：
+**模块化原则**：
 - 每个 `.h` 文件是 header-only（函数带 `static inline` 或 `static`），不生成额外 .o
-- `process.c` 的 `#include` 顺序就是依赖顺序
+- `process_new.c` 的 `#include` 顺序就是依赖顺序
 - 测试文件独立编译，不需要 BPF skeleton
 - 现有测试 (`test_process_utils`, `test_process_filter`) 不受影响
 
-**从 process.c 抽出的模块**：
+**process_ext/ 子目录模块清单**：
 
-| 模块 | 抽出的内容 | 行数（约） |
-|------|-----------|-----------|
-| `process_output.h` | `print_file_open_event()` + 新事件的 print 函数 | ~150 |
-| `process_dedup.h` | `file_hash_entry`, `get_file_open_count()`, `flush_pid_file_opens()`, rate limiting | ~250 |
-| `process_map_flush.h` | 统一 event_agg_map flush + per-pid flush + fd→path 解析 + overflow 检查 | ~150 |
-| `process_net.h` | sockaddr 解析, IP/port 格式化 | ~80 |
-| `process_mem_info.h` | read_proc_mem_info(), per-process RSS/shared/VmHWM | ~60 |
-
-重构后 `process.c` 的 main/handle_event 约 200 行，清晰可读。
+| 模块 | 内容 | 行数（约） |
+|------|------|-----------|
+| `bpf_common.h` | `is_pid_tracked()` + `update_agg_map()` + overflow 处理 | ~60 |
+| `bpf_fs.h` | unlinkat, renameat2, mkdirat, ftruncate, chdir + `extract_dir_prefix()` | ~120 |
+| `bpf_write.h` | write enter/exit + `write_fd_map`（临时上下文） | ~60 |
+| `bpf_net.h` | bind, listen, connect + sockaddr 内核读取 | ~80 |
+| `bpf_signals.h` | setpgid, setsid, kill, fork | ~80 |
+| `bpf_mem.h` | mmap (MAP_SHARED only) | ~30 |
+| `bpf_cow.h` | kprobe/do_wp_page | ~30 |
+| `output.h` | `print_summary_json()` + 新事件的 print 函数 | ~150 |
+| `dedup.h` | FILE_OPEN dedup（从 process.c 复制，独立实现） | ~250 |
+| `map_flush.h` | flush_agg_map() + flush_pid_from_agg_map() + fd→path 解析 | ~150 |
+| `net_fmt.h` | sockaddr 解析, IP/port 格式化 | ~80 |
+| `mem_info.h` | read_proc_mem_info(), per-process RSS/shared/VmHWM | ~60 |
 
 ## 测试计划
 
-### 现有测试（不修改）
+### 现有单元测试（不修改）
 
 ```bash
-make test  # 运行 test_process_utils + test_process_filter
+make test  # 运行全部 5 个测试套件（199 tests）
 ```
 
-### 新增单元测试
-
-#### test_process_output.c
-```c
-// 测试 SUMMARY JSON 输出格式（注意：新事件不用 struct event，用 agg_key + agg_value）
-void test_print_summary_fs_delete() {
-    struct agg_key key = { .pid = 1234, .event_type = EVENT_TYPE_FILE_DELETE };
-    strncpy(key.detail, "/testbed/venv/lib", DETAIL_LEN);
-    struct agg_value val = { .count = 47, .last_ts = 260000000000ULL };
-    strncpy(val.comm, "pip", TASK_COMM_LEN);
-    strncpy(val.extra, "/testbed/venv/lib/old.py", MAX_FILENAME_LEN);
-
-    char *output = capture_stdout(print_summary_json, &key, &val);
-    // 验证字段顺序：timestamp → event → comm → pid → type → ...
-    assert(json_field_order(output, "timestamp", "event", "comm", "pid", "type"));
-    assert(json_has_key(output, "event", "SUMMARY"));
-    assert(json_has_key(output, "type", "FILE_DELETE"));
-}
-
-void test_print_summary_net_bind() {
-    // 验证 IPv4 地址 + port 在 detail 字段中格式正确
-}
-
-void test_print_summary_write() {
-    // 验证 WRITE 包含 count, total_bytes, extra（fd→path 解析结果）
-}
-```
-
-#### test_process_dedup.c
-```c
-// 从现有 process.c 抽出 FILE_OPEN dedup 逻辑后的独立测试（新事件走 BPF map 聚合，不用 dedup）
-void test_dedup_same_file() {
-    // 同一 (pid, FILE_OPEN, path) 60 秒内只输出一次，count 累加
-}
-
-void test_dedup_window_expiry() {
-    // 60 秒后窗口到期，flush 带 count + window_expired
-}
-
-void test_dedup_process_exit_flush() {
-    // 进程退出时 flush 所有 pending 聚合
-}
-
-void test_dedup_rename_by_new_path() {
-    // FILE_RENAME 按 new_path 做 dedup key
-}
-
-void test_rate_limit() {
-    // 超过 MAX_DISTINCT_FILES_PER_SEC 后丢弃 + 警告
-}
-```
-
-#### test_process_net.c
-```c
-void test_parse_sockaddr_ipv4() {
-    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(8080), ... };
-    char ip[16]; uint16_t port;
-    parse_sockaddr((struct sockaddr *)&addr, ip, &port, ...);
-    assert(strcmp(ip, "0.0.0.0") == 0);
-    assert(port == 8080);
-}
-
-void test_parse_sockaddr_ipv6() { ... }
-void test_parse_sockaddr_unix() { ... }
-```
-
-#### test_process_map_flush.c
-```c
-void test_write_stats_flush() {
-    // 模拟多次 write 聚合，验证 flush 输出正确的 count + total_bytes
-}
-
-void test_fd_to_path_resolution() {
-    // 测试 /proc/pid/fd/N 读取（用实际 fd 测试）
-}
-```
+| 测试 | 测试数 | 覆盖内容 |
+|------|--------|---------|
+| test_process_utils | 24 | read_proc_comm, read_proc_ppid, command_matches_filter |
+| test_process_filter | 60 | PID 跟踪、hash、过滤模式 |
+| test_process_new_header | 49 | agg_key/agg_value 结构体布局、枚举值、常量 |
+| test_process_new_map_flush | 48 | event_type_name, json_escape, print_summary_json |
+| test_process_new_mem_info | 18 | /proc 内存信息读取，边界情况 |
 
 ### 集成测试（需要 root/eBPF）
 
+集成测试通过 Python 脚本 `bpf/tests/test_integration.py` 实现，需要 `sudo` + `python3`。Python 便于解析 JSON、管理子进程、做结构化断言。
+
+#### 运行方式
+
 ```bash
-# 回归：默认行为不变
-sudo ./process -c python -v    # 应只输出 EXEC/EXIT/FILE_OPEN/BASH_READLINE
-
-# 文件系统追踪
-sudo ./process --trace-fs -m 0 &
-pip install requests            # 应看到 DIR_CREATE, FILE_RENAME（带 count 聚合）
-rm /tmp/test.txt                # 应看到 FILE_DELETE
-echo "hello" > /tmp/test.txt    # 5 秒后应看到 SUMMARY type=WRITE
-
-# 网络追踪
-sudo ./process --trace-net -m 0 &
-python -m http.server 8080      # 应看到 NET_BIND + NET_LISTEN
-curl localhost:8080             # 应看到 NET_CONNECT
-
-# 进程协调追踪
-sudo ./process --trace-signals -m 0 &
-setsid sleep 100 &              # 应看到 PROC_FORK + SESSION_CREATE
-kill -9 $!                      # 应看到 SIGNAL_SEND
-
-# 全开
-sudo ./process --trace-all -c pip -m 2 &
-pip install flask               # 应看到所有事件类型，PID 过滤生效
+make process_new process          # 先构建
+sudo python3 tests/test_integration.py        # 运行全部集成测试
+sudo python3 tests/test_integration.py -k fs  # 只跑名字含 "fs" 的测试
+# 或
+make integration-test             # Makefile 快捷方式（含 sudo）
 ```
+
+#### Python 测试框架设计
+
+```python
+# tests/test_integration.py
+import subprocess, signal, json, tempfile, time, os, socket, mmap
+
+BPF_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROCESS_NEW = os.path.join(BPF_DIR, "process_new")
+PROCESS_OLD = os.path.join(BPF_DIR, "process")
+
+class TracerSession:
+    """启动 process_new 后台进程，收集 JSON 输出"""
+    def __init__(self, *extra_args, wait_attach=2):
+        self.outfile = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
+        self.proc = subprocess.Popen(
+            [PROCESS_NEW] + list(extra_args),
+            stdout=self.outfile, stderr=subprocess.DEVNULL)
+        time.sleep(wait_attach)  # 等 BPF 加载
+
+    def stop(self):
+        self.proc.send_signal(signal.SIGINT)  # 触发 final flush
+        self.proc.wait(timeout=10)
+        self.outfile.close()
+
+    def events(self) -> list[dict]:
+        """解析所有 JSON 行"""
+        with open(self.outfile.name) as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def find(self, **filters) -> list[dict]:
+        """按字段值过滤事件，例如 find(event="EXEC", comm="echo")"""
+        result = []
+        for ev in self.events():
+            if all(ev.get(k) == v for k, v in filters.items()):
+                result.append(ev)
+        return result
+
+    def find_summary(self, type_name, **extra) -> list[dict]:
+        """查找 SUMMARY 事件，例如 find_summary("FILE_DELETE")"""
+        return self.find(event="SUMMARY", type=type_name, **extra)
+
+    def assert_has(self, desc, **filters):
+        """断言至少存在一条匹配事件"""
+        matches = self.find(**filters)
+        assert len(matches) > 0, f"FAIL: {desc} — no events matching {filters}"
+        print(f"  [PASS] {desc} ({len(matches)} events)")
+
+    def assert_has_summary(self, desc, type_name, **extra):
+        matches = self.find_summary(type_name, **extra)
+        assert len(matches) > 0, f"FAIL: {desc} — no SUMMARY type={type_name}"
+        print(f"  [PASS] {desc} ({len(matches)} events)")
+
+    def assert_none(self, desc, **filters):
+        """断言不存在匹配事件"""
+        matches = self.find(**filters)
+        assert len(matches) == 0, f"FAIL: {desc} — found {len(matches)} unexpected events"
+        print(f"  [PASS] {desc} (0 events, correct)")
+```
+
+#### 测试用例（每个 test 函数是独立用例）
+
+| # | 函数名 | CLI flags | 工作负载 | 验证内容 |
+|---|--------|-----------|----------|----------|
+| 1 | `test_basic_lifecycle` | `-m 0` | `subprocess.run(["/bin/echo", "hello"])` | EXEC+EXIT, pid/ppid/filename/exit_code=0 |
+| 2 | `test_nonzero_exit` | `-m 0` | `bash -c 'exit 42'` | EXIT exit_code=42 |
+| 3 | `test_command_filter` | `-c bash` | bash + python 子进程 | bash 有 EXEC，python3 无 EXEC |
+| 4 | `test_pid_filter` | `-p PID` | 指定 PID + 无关进程 | 仅目标 PID |
+| 5 | `test_mode_all` | `-m 0` | echo + python | 两者都有 EXEC |
+| 6 | `test_trace_fs` | `-m 0 --trace-fs` | os.mkdir/os.remove/os.rename/os.truncate/os.chdir | SUMMARY: DIR_CREATE, FILE_DELETE, FILE_RENAME, FILE_TRUNCATE, CHDIR |
+| 7 | `test_trace_write` | `-m 0 --trace-fs` | `dd if=/dev/zero bs=1024 count=10` | SUMMARY WRITE，total_bytes > 0 |
+| 8 | `test_trace_net` | `-m 0 --trace-net` | socket bind+listen+connect (port 19876) | NET_BIND(含端口), NET_LISTEN, NET_CONNECT(含端口) |
+| 9 | `test_trace_signals` | `-m 0 --trace-signals` | os.fork + os.kill | PROC_FORK, SIGNAL_SEND |
+| 10 | `test_bash_readline` | `-m 0` | `echo cmd \| bash -i` | BASH_READLINE（软失败 pytest.skip） |
+| 11 | `test_file_open` | `-m 0` | `cat /etc/hostname` | FILE_OPEN 含 filepath |
+| 12 | `test_trace_all` | `-m 0 --trace-all` | fs+net+signal 组合 | 所有 SUMMARY 类型都出现 |
+| 13 | `test_multi_app` | `-m 0` | bash + python 并发子进程 | 两种 comm 都捕获 |
+| 14 | `test_compat` | `-m 0` | echo | process vs process_new EXEC/EXIT/FILE_OPEN 字段一致 |
+| 15 | `test_summary_json_schema` | `-m 0 --trace-fs` | mkdir+rm | SUMMARY 字段类型：timestamp=int, comm=str, pid=int, count=int |
+| 16 | `test_flush_on_sigint` | `-m 0 --trace-fs` | mkdir+rm，1s 后停 | 不到 5s 也有 SUMMARY |
+| 17 | `test_trace_mem` | `-m 0 --trace-mem` | mmap.mmap(MAP_SHARED) | MMAP_SHARED 事件 |
+| 18 | `test_duration_filter` | `-m 0 -d 2000` | echo(快) + sleep 3(慢) | 仅长时间进程 EXIT |
+| 19 | `test_idempotent` | `-m 0` | 两次 TracerSession | 两次都成功 |
+
+#### 关键测试场景详解
+
+**test_trace_fs** — 最重要的集成测试，直接用 Python os 模块触发 syscall：
+```python
+def test_trace_fs(tmp_path):
+    t = TracerSession("-m", "0", "--trace-fs")
+    workdir = tmp_path / "fs_test"
+    workdir.mkdir()
+    # 触发各种 FS syscall
+    subprocess.run(["/bin/bash", "-c", f"""
+        cd {workdir}
+        mkdir -p subdir1
+        echo data > to_delete.txt && rm to_delete.txt
+        echo data > old.txt && mv old.txt new.txt
+        truncate -s 0 new.txt
+        cd subdir1
+    """])
+    time.sleep(1)
+    t.stop()
+    t.assert_has_summary("mkdir → DIR_CREATE", "DIR_CREATE")
+    t.assert_has_summary("rm → FILE_DELETE", "FILE_DELETE")
+    t.assert_has_summary("mv → FILE_RENAME", "FILE_RENAME")
+    t.assert_has_summary("truncate → FILE_TRUNCATE", "FILE_TRUNCATE")
+    t.assert_has_summary("cd → CHDIR", "CHDIR")
+```
+
+**test_trace_net** — Python 直接做 socket 操作，精确控制端口：
+```python
+def test_trace_net():
+    t = TracerSession("-m", "0", "--trace-net")
+    # 用子进程避免 tracer 自己的 socket 被捕获
+    subprocess.run(["python3", "-c", """
+import socket
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(('127.0.0.1', 19876))
+srv.listen(1)
+cli = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+cli.connect(('127.0.0.1', 19876))
+conn, _ = srv.accept()
+conn.close(); cli.close(); srv.close()
+"""])
+    time.sleep(1)
+    t.stop()
+    # 验证 detail 包含端口号
+    binds = t.find_summary("NET_BIND")
+    assert any("19876" in e.get("detail", "") for e in binds), "NET_BIND should contain port 19876"
+    t.assert_has_summary("listen", "NET_LISTEN")
+    connects = t.find_summary("NET_CONNECT")
+    assert any("19876" in e.get("detail", "") for e in connects), "NET_CONNECT should contain port 19876"
+```
+
+**test_compat** — 对比 `process` 和 `process_new` 的核心 JSON 字段：
+```python
+def test_compat():
+    if not os.path.isfile(PROCESS_OLD):
+        print("  [SKIP] process binary not found")
+        return
+    # 运行两个 tracer 对同一工作负载
+    for binary, label in [(PROCESS_OLD, "old"), (PROCESS_NEW, "new")]:
+        # ... 启动、运行 echo、停止、收集事件 ...
+    # 对比 EXEC 字段集合
+    required_exec = {"event", "comm", "pid", "ppid", "filename", "timestamp"}
+    required_exit = {"event", "comm", "pid", "ppid", "exit_code", "timestamp"}
+    required_file_open = {"event", "comm", "pid", "filepath", "flags"}
+    # 验证 process_new 输出的字段集是 process 输出字段集的超集
+```
+
+**test_summary_json_schema** — 验证每条 SUMMARY 的字段类型：
+```python
+def test_summary_json_schema():
+    # ... 触发一些 FS 操作 ...
+    for ev in t.find(event="SUMMARY"):
+        assert isinstance(ev["timestamp"], int), "timestamp must be int"
+        assert isinstance(ev["comm"], str), "comm must be str"
+        assert isinstance(ev["pid"], int), "pid must be int"
+        assert isinstance(ev["type"], str), "type must be str"
+        assert isinstance(ev["detail"], str), "detail must be str"
+        assert isinstance(ev["count"], int), "count must be int"
+        if "total_bytes" in ev:
+            assert isinstance(ev["total_bytes"], int), "total_bytes must be int"
+        if "extra" in ev:
+            assert isinstance(ev["extra"], str), "extra must be str"
+```
+
+#### 注意事项
+
+- **需要 root**：脚本开头检查 `os.geteuid() == 0`，否则提示 `sudo`
+- **BPF 加载等待**：`wait_attach=2` 秒，给 BPF skeleton open/load/attach 足够时间
+- **SIGINT flush**：`process_new.c:669` 在退出时调用 `flush_agg_map()`，确保不丢聚合事件
+- **BASH_READLINE** (Test 10)：uretprobe 依赖 `/usr/bin/bash:readline`，非交互 bash 可能不触发，标记软失败
+- **--trace-cow 不测**：kprobe/do_wp_page 依赖内核版本，且不含在 --trace-all 中
+- **端口 19876**：高端口避免冲突，`SO_REUSEADDR` 防绑定失败
+- **系统噪声**：`-m 0` 捕获所有进程，断言用 comm/port 等字段精确过滤
+- **清理**：每个测试用 `tempfile` 创建临时目录，结束自动清理
 
 ## 实施步骤
 
-### Step 1：重构 process.c 为模块化结构（1-2 小时）
+### Step 1：搭建 process_new 骨架（1 小时）
 
-**先不加新功能**，只做代码搬移：
-- 抽出 `process_output.h`（print 函数）
-- 抽出 `process_dedup.h`（dedup + rate limit 逻辑）
-- 验证 `make process && make test` 通过，行为不变
+**创建独立的新程序，复制现有核心逻辑**：
 
-### Step 2：基础设施——统一 map + PID 过滤 + flush 循环（1-2 小时）
+- 创建 `bpf/process_ext/` 子目录
+- 创建 `bpf/process_new.h`：复制 `process.h` 内容 + 新增 `agg_key` / `agg_value` / 新 event_type enum
+- 创建 `bpf/process_new.bpf.c`：从 `process.bpf.c` 复制现有 handlers（handle_exec/handle_exit/trace_openat/trace_open/bash_readline）+ 新增 maps（event_agg_map/tracked_pids/agg_overflow_count）+ feature flags
+- 创建 `bpf/process_new.c`：从 `process.c` 复制 main/handle_event/CLI 解析，改 skeleton 引用为 `process_new`
+- 更新 `Makefile`：新增 `process_new` 编译目标（`APPS += process_new`）
+- 验证：`make process_new` 编译通过，`./process_new -c python` 行为与 `./process` 一致
+
+### Step 2：基础设施——PID 过滤 + flush 循环（1 小时）
 
 **在加任何新 tracepoint 之前**，先搭好基础设施：
 
-- `process.h`：新增 `agg_key` / `agg_value` 结构 + 新 event_type enum
-- `process.bpf.c`：新增 `event_agg_map` + `tracked_pids` + `agg_overflow_count` + feature flags
-- `process_bpf_common.h`：`is_pid_tracked()` + `update_agg_map()` 通用辅助
-- `process.c`：主循环从 `ring_buffer__poll(rb, -1)` 改为 `ring_buffer__poll(rb, POLL_TIMEOUT_MS)` + 定时调用 `flush_agg_map()`
-- `process_map_flush.h`：`flush_agg_map()` + `flush_pid_from_agg_map()`
-- `process.c` handle_event：EXEC 时写 `tracked_pids`，EXIT 时删除 + 调用 `flush_pid_from_agg_map()`
-- 验证：无新 flag 时行为完全不变（map 为空，flush 不输出）
+- `process_ext/bpf_common.h`：`is_pid_tracked()` + `update_agg_map()` 通用辅助
+- `process_ext/map_flush.h`：`flush_agg_map()` + `flush_pid_from_agg_map()`
+- `process_new.c`：主循环从 `ring_buffer__poll(rb, -1)` 改为 `ring_buffer__poll(rb, POLL_TIMEOUT_MS)` + 定时调用 `flush_agg_map()`
+- `process_new.c` handle_event：EXEC 时写 `tracked_pids`，EXIT 时删除 + 调用 `flush_pid_from_agg_map()`
+- 验证：无新 flag 时行为与现有 `process` 完全一致（map 为空，flush 不输出）
 
 ### Step 3：分批新增 BPF tracepoints（2-3 小时）
 
 每批加完即可测试：
 
 **批次 A（文件系统 mutations）**：
-- 新增 `process_bpf_fs.h`：`unlinkat`, `renameat2`, `mkdirat`, `ftruncate`, `chdir`（全部调用 `update_agg_map`）
-- 新增 `process_bpf_write.h`：write enter/exit + `write_fd_map`（临时上下文）→ 聚合到 `event_agg_map`
+- 新增 `process_ext/bpf_fs.h`：`unlinkat`, `renameat2`, `mkdirat`, `ftruncate`, `chdir`（全部调用 `update_agg_map`）
+- 新增 `process_ext/bpf_write.h`：write enter/exit + `write_fd_map`（临时上下文）→ 聚合到 `event_agg_map`
 - 新增 `extract_dir_prefix()` BPF inline helper
 
 **批次 B（网络）**：
-- 新增 `process_bpf_net.h`：`bind`, `listen`, `connect`
-- 新增 `process_net_fmt.h`（用户空间 sockaddr 解析）+ `test_process_net.c`
+- 新增 `process_ext/bpf_net.h`：`bind`, `listen`, `connect`
+- 新增 `process_ext/net_fmt.h`（用户空间 sockaddr 解析）+ `tests/test_process_new_net.c`
 
 **批次 C（进程协调）**：
-- 新增 `process_bpf_signals.h`：`setpgid`, `setsid`, `kill`, `sched_process_fork`
+- 新增 `process_ext/bpf_signals.h`：`setpgid`, `setsid`, `kill`, `sched_process_fork`
 - 参数都是整数，实现最简单
 
 **批次 D（内存）**：
-- 新增 `process_bpf_mem.h`：`mmap`（内核侧过滤仅 MAP_SHARED）
+- 新增 `process_ext/bpf_mem.h`：`mmap`（内核侧过滤仅 MAP_SHARED）
 
 **批次 E（CoW page fault 追踪）**：
-- 新增 `process_bpf_cow.h`：kprobe/`do_wp_page`
+- 新增 `process_ext/bpf_cow.h`：kprobe/`do_wp_page`
 - 需要内核版本兼容处理（BTF 查找符号）
 - 不含在 `--trace-all` 中
 
 ### Step 4：用户空间增强（1 小时）
 
-- CLI 参数：`--trace-fs`, `--trace-net`, `--trace-signals`, `--trace-mem`, `--trace-cow`, `--trace-all`
+- `process_new.c` CLI 新增参数：`--trace-fs`, `--trace-net`, `--trace-signals`, `--trace-mem`, `--trace-cow`, `--trace-all`
 - 设置 BPF feature flags + `filter_pids`
-- per-process 内存采集：在 EXEC/EXIT handle_event 中调用 `read_proc_mem_info()`
+- per-process 内存采集：`process_ext/mem_info.h`，在 EXEC/EXIT handle_event 中调用
 - fd→path 解析：flush 时读 `/proc/<pid>/fd/<fd>`
+- `process_ext/output.h`：JSON 输出函数
+- `process_ext/dedup.h`：FILE_OPEN dedup（从 process.c 复制）
 
 ### Step 5：新增测试（1 小时）
 
-- 将现有 `test_process_utils.c`、`test_process_filter.c` 移入 `tests/`
-- 新增 `tests/test_process_output.c`
-- 新增 `tests/test_process_dedup.c`（扩展覆盖新事件类型的 dedup）
-- 新增 `tests/test_process_net.c`
-- 新增 `tests/test_process_map_flush.c`（flush 逻辑 + fd→path）
-- 更新 Makefile：测试编译路径指向 `tests/`，`make test` 运行全部测试
+- 新增 `tests/test_process_new_output.c`（SUMMARY JSON 格式验证）
+- 新增 `tests/test_process_new_dedup.c`（dedup 逻辑）
+- 新增 `tests/test_process_new_net.c`（sockaddr 解析）
+- 新增 `tests/test_process_new_map_flush.c`（flush 逻辑 + fd→path）
+- 更新 Makefile：新测试目标，`make test` 同时运行新旧测试
+- **现有测试不修改**
 
 ### Step 6：集成测试 + Rust collector（30 分钟）
 
-- 手动运行集成测试
-- 可选：给 `ProcessRunner` 加 `with_trace_features()` builder
+- 手动运行集成测试（用 `process_new` 代替 `process`）
+- 可选：给 `ProcessRunner` 加 `with_trace_features()` builder，可选择运行 `process_new` 二进制
 
 ## 与论文实验的对应
 
@@ -1176,14 +1284,17 @@ pip install flask               # 应看到所有事件类型，PID 过滤生效
 
 ## 设计约束
 
-1. **统一聚合 map**——所有新增事件走同一个 `event_agg_map`，不引入独立的 per-事件-类型 map
-2. **struct event 不变**——新事件不用 struct event，不占 ring buffer。ring buffer 只给现有 4 种事件
-3. **BPF 侧 PID 过滤**——新事件在 BPF handler 中通过 `tracked_pids` map 过滤，防止 map 被无关进程污染
-4. **handle_event 不处理新事件**——新事件通过定时 flush 循环输出，不在 ring buffer 回调中出现
-5. **不修改现有接口**——不加新 flag 时行为、性能完全不变
-6. **现有 FILE_OPEN 不变**——仍用用户空间 60 秒窗口 dedup（向后兼容）
-7. **主循环改为 poll+flush**——`ring_buffer__poll(rb, TIMEOUT)` 带超时，每次返回后检查 flush timer
-8. **map 溢出可观测**——overflow per-CPU counter + 用户空间警告 JSON
-9. **mmap() 内核侧过滤**——只聚合 MAP_SHARED 的 mmap，忽略 MAP_PRIVATE
-10. **--trace-cow 不含在 --trace-all 中**——page fault 追踪开销较高且是专用场景，需显式启用
-11. **per-process 内存采集是用户空间增强**——不需要新 BPF 程序，只在 handle_event 中读 /proc
+1. **现有文件不修改**——`process.bpf.c`、`process.c`、`process.h` 完全不动，零回归风险
+2. **独立编译目标**——`process_new` 是独立的 `make` 目标，不影响 `make process`
+3. **头文件集中在子目录**——所有新增模块放在 `bpf/process_ext/`，不污染 `bpf/` 顶层
+4. **统一聚合 map**——所有新增事件走同一个 `event_agg_map`，不引入独立的 per-事件-类型 map
+5. **struct event 不变**——新事件不用 struct event，不占 ring buffer。ring buffer 只给现有 4 种事件
+6. **BPF 侧 PID 过滤**——新事件在 BPF handler 中通过 `tracked_pids` map 过滤，防止 map 被无关进程污染
+7. **handle_event 不处理新事件**——新事件通过定时 flush 循环输出，不在 ring buffer 回调中出现
+8. **process_new 默认行为与 process 一致**——不加新 flag 时行为、性能完全相同
+9. **现有 FILE_OPEN 不变**——仍用用户空间 60 秒窗口 dedup（向后兼容）
+10. **主循环改为 poll+flush**——`ring_buffer__poll(rb, TIMEOUT)` 带超时，每次返回后检查 flush timer
+11. **map 溢出可观测**——overflow per-CPU counter + 用户空间警告 JSON
+12. **mmap() 内核侧过滤**——只聚合 MAP_SHARED 的 mmap，忽略 MAP_PRIVATE
+13. **--trace-cow 不含在 --trace-all 中**——page fault 追踪开销较高且是专用场景，需显式启用
+14. **per-process 内存采集是用户空间增强**——不需要新 BPF 程序，只在 handle_event 中读 /proc
