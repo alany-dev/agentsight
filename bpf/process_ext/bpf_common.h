@@ -16,6 +16,23 @@ static __always_inline bool is_pid_tracked(void)
 	return bpf_map_lookup_elem(&tracked_pids, &pid) != NULL;
 }
 
+static __always_inline bool is_cgroup_tracked(void)
+{
+	if (!filter_cgroup)
+		return true;
+	u64 cgroup_id = bpf_get_current_cgroup_id();
+	if (cgroup_id == target_cgroup_id)
+		return true;
+	if (!filter_cgroup_children)
+		return false;
+	return bpf_map_lookup_elem(&tracked_cgroups, &cgroup_id) != NULL;
+}
+
+static __always_inline bool is_event_tracked(void)
+{
+	return is_cgroup_tracked() && is_pid_tracked();
+}
+
 static __always_inline void update_agg_map(struct agg_key *key, u64 count, u64 bytes)
 {
 	struct agg_value *val = bpf_map_lookup_elem(&event_agg_map, key);

@@ -13,7 +13,7 @@ int trace_cow_fault(struct pt_regs *ctx)
 {
 	if (!trace_cow)
 		return 0;
-	if (!is_pid_tracked())
+	if (!is_event_tracked())
 		return 0;
 
 	struct agg_key key = {};

@@ -41,6 +41,14 @@ struct {
 	__type(value, u8);
 } tracked_pids SEC(".maps");
 
+/* Optional cgroup subtree filter (used when --cgroup-filter-children is set) */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_TRACKED_CGROUPS);
+	__type(key, u64);
+	__type(value, u8);
+} tracked_cgroups SEC(".maps");
+
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, 1);
@@ -56,18 +64,21 @@ struct {
 	__type(value, struct exit_mem_info);
 } exit_mem SEC(".maps");
 
-/* write() enter/exit pairing context (not aggregation) */
+/* write-family enter/exit pairing context (not aggregation) */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 8192);
 	__type(key, u64);   /* pid_tgid */
 	__type(value, int);  /* fd */
-} write_fd_map SEC(".maps");
+} write_ctx_map SEC(".maps");
 
 /* ========== Feature flags ========== */
 
 const volatile unsigned long long min_duration_ns = 0;
 const volatile bool filter_pids = false;
+const volatile bool filter_cgroup = false;
+const volatile bool filter_cgroup_children = false;
+const volatile unsigned long long target_cgroup_id = 0;
 const volatile bool trace_fs_mutations = false;
 const volatile bool trace_network = false;
 const volatile bool trace_signals = false;
@@ -86,6 +97,9 @@ int BPF_URETPROBE(bash_readline, const void *ret)
 	struct event *e;
 	char comm[TASK_COMM_LEN];
 	u32 pid;
+
+	if (!is_cgroup_tracked())
+		return 0;
 
 	if (!ret)
 		return 0;
@@ -122,6 +136,9 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 	struct event *e;
 	pid_t pid;
 	u64 ts;
+
+	if (!is_cgroup_tracked())
+		return 0;
 
 	pid = bpf_get_current_pid_tgid() >> 32;
 	task = (struct task_struct *)bpf_get_current_task();
@@ -179,6 +196,9 @@ int handle_exit(struct trace_event_raw_sched_process_template *ctx)
 	struct event *e;
 	pid_t pid, tid;
 	u64 id, ts, *start_ts, duration_ns = 0;
+
+	if (!is_cgroup_tracked())
+		return 0;
 
 	id = bpf_get_current_pid_tgid();
 	pid = id >> 32;
@@ -238,6 +258,9 @@ int trace_openat(struct trace_event_raw_sys_enter *ctx)
 	int flags;
 	const char *filename;
 
+	if (!is_cgroup_tracked())
+		return 0;
+
 	pid = bpf_get_current_pid_tgid() >> 32;
 
 	filename = (const char *)ctx->args[1];
@@ -276,6 +299,9 @@ int trace_open(struct trace_event_raw_sys_enter *ctx)
 	char filepath[MAX_FILENAME_LEN];
 	int flags;
 	const char *filename;
+
+	if (!is_cgroup_tracked())
+		return 0;
 
 	pid = bpf_get_current_pid_tgid() >> 32;
 

@@ -55,7 +55,7 @@ int trace_bind(struct trace_event_raw_sys_enter *ctx)
 {
 	if (!trace_network)
 		return 0;
-	if (!is_pid_tracked())
+	if (!is_event_tracked())
 		return 0;
 
 	struct agg_key key = {};
@@ -80,7 +80,7 @@ int trace_listen(struct trace_event_raw_sys_enter *ctx)
 {
 	if (!trace_network)
 		return 0;
-	if (!is_pid_tracked())
+	if (!is_event_tracked())
 		return 0;
 
 	int fd = (int)ctx->args[0];
@@ -99,7 +99,7 @@ int trace_connect(struct trace_event_raw_sys_enter *ctx)
 {
 	if (!trace_network)
 		return 0;
-	if (!is_pid_tracked())
+	if (!is_event_tracked())
 		return 0;
 
 	struct agg_key key = {};

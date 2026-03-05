@@ -6,6 +6,7 @@
 
 /* Aggregation key detail length */
 #define DETAIL_LEN 64
+#define MAX_TRACKED_CGROUPS 16384
 
 /* Aggregation key: group by (pid, event_type, detail) */
 struct agg_key {

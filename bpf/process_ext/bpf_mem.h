@@ -12,7 +12,7 @@ int trace_mmap(struct trace_event_raw_sys_enter *ctx)
 {
 	if (!trace_memory)
 		return 0;
-	if (!is_pid_tracked())
+	if (!is_event_tracked())
 		return 0;
 
 	int flags = (int)ctx->args[3];

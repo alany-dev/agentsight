@@ -35,7 +35,7 @@ static __always_inline int agg_path_event(const char *user_path, u32 event_type)
 {
 	if (!trace_fs_mutations)
 		return 0;
-	if (!is_pid_tracked())
+	if (!is_event_tracked())
 		return 0;
 
 	char filepath[MAX_FILENAME_LEN];
@@ -127,7 +127,7 @@ int trace_ftruncate(struct trace_event_raw_sys_enter *ctx)
 {
 	if (!trace_fs_mutations)
 		return 0;
-	if (!is_pid_tracked())
+	if (!is_event_tracked())
 		return 0;
 
 	int fd = (int)ctx->args[0];
@@ -146,7 +146,7 @@ int trace_chdir(struct trace_event_raw_sys_enter *ctx)
 {
 	if (!trace_fs_mutations)
 		return 0;
-	if (!is_pid_tracked())
+	if (!is_event_tracked())
 		return 0;
 
 	char path[DETAIL_LEN];

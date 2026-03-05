@@ -48,7 +48,7 @@ int trace_setpgid(struct trace_event_raw_sys_enter *ctx)
 {
 	if (!trace_signals)
 		return 0;
-	if (!is_pid_tracked())
+	if (!is_event_tracked())
 		return 0;
 
 	int target_pid = (int)ctx->args[0];
@@ -74,7 +74,7 @@ int trace_setsid(struct trace_event_raw_sys_enter *ctx)
 {
 	if (!trace_signals)
 		return 0;
-	if (!is_pid_tracked())
+	if (!is_event_tracked())
 		return 0;
 
 	u32 pid = bpf_get_current_pid_tgid() >> 32;
@@ -97,7 +97,7 @@ int trace_kill(struct trace_event_raw_sys_enter *ctx)
 {
 	if (!trace_signals)
 		return 0;
-	if (!is_pid_tracked())
+	if (!is_event_tracked())
 		return 0;
 
 	int target_pid = (int)ctx->args[0];
@@ -123,7 +123,7 @@ int trace_fork(struct trace_event_raw_sched_process_fork *ctx)
 {
 	if (!trace_signals)
 		return 0;
-	if (!is_pid_tracked())
+	if (!is_event_tracked())
 		return 0;
 
 	struct agg_key key = {};

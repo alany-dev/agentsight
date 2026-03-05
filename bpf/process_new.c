@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <time.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include <dirent.h>
@@ -74,6 +75,9 @@ static struct env {
 	bool resource_detail;
 	int sample_interval_ms;
 	char cgroup_path[256];
+	char cgroup_filter_path[256];
+	bool cgroup_filter_enabled;
+	bool cgroup_filter_children;
 } env = {
 	.verbose = false,
 	.min_duration_ms = 0,
@@ -89,6 +93,7 @@ static struct pid_tracker pid_tracker;
 static struct process_new_bpf *g_skel;
 static int g_agg_map_fd = -1;
 static int g_tracked_pids_fd = -1;
+static int g_tracked_cgroups_fd = -1;
 static int g_overflow_fd = -1;
 static int g_exit_mem_fd = -1;
 
@@ -106,7 +111,8 @@ const char argp_program_doc[] =
 "Compatible with process tracer + additional tracing capabilities.\n"
 "\n"
 "USAGE: ./process_new [-d <min-duration-ms>] [-c <cmd>] [-p <pid>] [-m <mode>] [-v]\n"
-"       [--trace-fs] [--trace-net] [--trace-signals] [--trace-mem] [--trace-cow] [--trace-all]\n";
+"       [--trace-fs] [--trace-net] [--trace-signals] [--trace-mem] [--trace-cow] [--trace-all]\n"
+"       [--cgroup-filter <path>] [--cgroup-filter-children]\n";
 
 enum {
 	OPT_TRACE_FS = 256,
@@ -119,6 +125,8 @@ enum {
 	OPT_RESOURCE_DETAIL,
 	OPT_SAMPLE_INTERVAL,
 	OPT_CGROUP,
+	OPT_CGROUP_FILTER,
+	OPT_CGROUP_FILTER_CHILDREN,
 };
 
 static const struct argp_option opts[] = {
@@ -138,6 +146,8 @@ static const struct argp_option opts[] = {
 	{ "resource-detail", OPT_RESOURCE_DETAIL, NULL, 0, "Also output per-process resource detail (requires --trace-resources)" },
 	{ "sample-interval", OPT_SAMPLE_INTERVAL, "MS", 0, "Resource sampling interval in milliseconds (default: 1000)" },
 	{ "cgroup", OPT_CGROUP, "PATH", 0, "Cgroup v2 path for resource sampling (auto-detected if omitted)" },
+	{ "cgroup-filter", OPT_CGROUP_FILTER, "PATH", 0, "Hard filter by cgroup v2 path (container-level isolation)" },
+	{ "cgroup-filter-children", OPT_CGROUP_FILTER_CHILDREN, NULL, 0, "Include descendants of --cgroup-filter path (sub-cgroup match)" },
 	{},
 };
 
@@ -244,6 +254,14 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		strncpy(env.cgroup_path, arg, sizeof(env.cgroup_path) - 1);
 		env.cgroup_path[sizeof(env.cgroup_path) - 1] = '\0';
 		break;
+	case OPT_CGROUP_FILTER:
+		strncpy(env.cgroup_filter_path, arg, sizeof(env.cgroup_filter_path) - 1);
+		env.cgroup_filter_path[sizeof(env.cgroup_filter_path) - 1] = '\0';
+		env.cgroup_filter_enabled = true;
+		break;
+	case OPT_CGROUP_FILTER_CHILDREN:
+		env.cgroup_filter_children = true;
+		break;
 	case ARGP_KEY_ARG:
 		argp_usage(state);
 		break;
@@ -264,6 +282,155 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
 	if (level == LIBBPF_DEBUG && !env.verbose)
 		return 0;
 	return vfprintf(stderr, format, args);
+}
+
+static void print_clock_sync_anchor(const char *phase)
+{
+	struct timespec mono = {0}, realtime = {0};
+	if (clock_gettime(CLOCK_MONOTONIC, &mono) != 0)
+		return;
+	if (clock_gettime(CLOCK_REALTIME, &realtime) != 0)
+		return;
+
+	uint64_t mono_ns = (uint64_t)mono.tv_sec * 1000000000ULL + (uint64_t)mono.tv_nsec;
+	uint64_t wall_ns = (uint64_t)realtime.tv_sec * 1000000000ULL + (uint64_t)realtime.tv_nsec;
+
+	struct tm tm_utc;
+	char wall_prefix[64];
+	if (!gmtime_r(&realtime.tv_sec, &tm_utc))
+		return;
+	if (strftime(wall_prefix, sizeof(wall_prefix), "%Y-%m-%dT%H:%M:%S", &tm_utc) == 0)
+		return;
+
+	printf("{\"timestamp\":%llu,\"event\":\"CLOCK_SYNC\","
+	       "\"phase\":\"%s\",\"mono_ns\":%llu,"
+	       "\"wall_time_ns\":%llu,"
+	       "\"wall_time\":\"%s.%09ldZ\"}\n",
+	       (unsigned long long)mono_ns,
+	       phase ? phase : "unknown",
+	       (unsigned long long)mono_ns,
+	       (unsigned long long)wall_ns,
+	       wall_prefix, realtime.tv_nsec);
+	fflush(stdout);
+}
+
+static bool normalize_cgroup_path(const char *input, char *output, size_t output_len)
+{
+	if (!input || !input[0] || !output || output_len == 0)
+		return false;
+
+	/* Absolute cgroup path from /proc/<pid>/cgroup or podman inspect */
+	if (strncmp(input, "/sys/fs/cgroup", 14) == 0) {
+		snprintf(output, output_len, "%s", input);
+		return true;
+	}
+	if (input[0] == '/') {
+		snprintf(output, output_len, "/sys/fs/cgroup%s", input);
+		return true;
+	}
+
+	/* Relative path */
+	snprintf(output, output_len, "/sys/fs/cgroup/%s", input);
+	return true;
+}
+
+static bool resolve_cgroup_id_from_path(const char *cgroup_path, uint64_t *out_id)
+{
+	if (!cgroup_path || !cgroup_path[0] || !out_id)
+		return false;
+
+	char normalized[512];
+	if (!normalize_cgroup_path(cgroup_path, normalized, sizeof(normalized)))
+		return false;
+
+	struct stat st;
+	if (stat(normalized, &st) != 0)
+		return false;
+
+	*out_id = (uint64_t)st.st_ino;
+	return true;
+}
+
+static void clear_u64_set_map(int map_fd)
+{
+	uint64_t key = 0, next_key = 0;
+
+	if (map_fd < 0)
+		return;
+	if (bpf_map_get_next_key(map_fd, NULL, &next_key) != 0)
+		return;
+
+	do {
+		key = next_key;
+		bpf_map_delete_elem(map_fd, &key);
+	} while (bpf_map_get_next_key(map_fd, &key, &next_key) == 0);
+}
+
+static bool add_cgroup_path_inode_to_map(const char *path, int map_fd, int *added_count)
+{
+	struct stat st;
+	uint64_t cgroup_id;
+	uint8_t present = 1;
+
+	if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode))
+		return false;
+	cgroup_id = (uint64_t)st.st_ino;
+	if (bpf_map_update_elem(map_fd, &cgroup_id, &present, BPF_ANY) == 0) {
+		if (added_count)
+			(*added_count)++;
+		return true;
+	}
+	return false;
+}
+
+static int add_descendant_cgroup_ids(const char *root, int map_fd, int *added_count)
+{
+	DIR *dir = opendir(root);
+	if (!dir)
+		return -errno;
+
+	struct dirent *entry;
+	while ((entry = readdir(dir)) != NULL) {
+		char child[1024];
+		struct stat st;
+
+		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+			continue;
+
+		if (snprintf(child, sizeof(child), "%s/%s", root, entry->d_name) >= (int)sizeof(child))
+			continue;
+		if (stat(child, &st) != 0 || !S_ISDIR(st.st_mode))
+			continue;
+
+		add_cgroup_path_inode_to_map(child, map_fd, added_count);
+		add_descendant_cgroup_ids(child, map_fd, added_count);
+	}
+
+	closedir(dir);
+	return 0;
+}
+
+static int populate_cgroup_filter_map(const char *cgroup_path, bool include_children, int map_fd)
+{
+	char normalized[512];
+	int added = 0;
+
+	if (map_fd < 0)
+		return -EINVAL;
+	if (!normalize_cgroup_path(cgroup_path, normalized, sizeof(normalized)))
+		return -EINVAL;
+
+	clear_u64_set_map(map_fd);
+	if (!add_cgroup_path_inode_to_map(normalized, map_fd, &added))
+		return -ENOENT;
+
+	if (include_children) {
+		int rc = add_descendant_cgroup_ids(normalized, map_fd, &added);
+		if (rc < 0)
+			return rc;
+	}
+
+	return added;
 }
 
 static volatile bool exiting = false;
@@ -623,6 +790,10 @@ int main(int argc, char **argv)
 	err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
 	if (err)
 		return err;
+	if (env.cgroup_filter_children && !env.cgroup_filter_enabled) {
+		fprintf(stderr, "--cgroup-filter-children requires --cgroup-filter <path>\n");
+		return 1;
+	}
 
 	page_size_kb = sysconf(_SC_PAGESIZE) / 1024;
 	if (page_size_kb <= 0)
@@ -653,6 +824,22 @@ int main(int argc, char **argv)
 			       (env.command_count > 0 || env.pid > 0);
 	skel->rodata->filter_pids = need_pid_filter;
 
+	/* Optional hard cgroup filter for container-level isolation */
+	bool need_cgroup_filter = false;
+	uint64_t cgroup_filter_id = 0;
+	if (env.cgroup_filter_enabled) {
+		if (!resolve_cgroup_id_from_path(env.cgroup_filter_path, &cgroup_filter_id)) {
+			fprintf(stderr, "Failed to resolve cgroup filter path: %s\n",
+			        env.cgroup_filter_path);
+			err = -EINVAL;
+			goto cleanup;
+		}
+		need_cgroup_filter = true;
+	}
+	skel->rodata->filter_cgroup = need_cgroup_filter;
+	skel->rodata->filter_cgroup_children = env.cgroup_filter_children;
+	skel->rodata->target_cgroup_id = cgroup_filter_id;
+
 	err = process_new_bpf__load(skel);
 	if (err) {
 		fprintf(stderr, "Failed to load BPF skeleton\n");
@@ -662,8 +849,21 @@ int main(int argc, char **argv)
 	g_skel = skel;
 	g_agg_map_fd = bpf_map__fd(skel->maps.event_agg_map);
 	g_tracked_pids_fd = bpf_map__fd(skel->maps.tracked_pids);
+	g_tracked_cgroups_fd = bpf_map__fd(skel->maps.tracked_cgroups);
 	g_overflow_fd = bpf_map__fd(skel->maps.agg_overflow_count);
 	g_exit_mem_fd = bpf_map__fd(skel->maps.exit_mem);
+
+	if (need_cgroup_filter && env.cgroup_filter_children) {
+		int cgroups = populate_cgroup_filter_map(env.cgroup_filter_path, true, g_tracked_cgroups_fd);
+		if (cgroups < 0) {
+			fprintf(stderr, "Failed to populate descendant cgroups from %s: %s\n",
+			        env.cgroup_filter_path, strerror(-cgroups));
+			err = cgroups;
+			goto cleanup;
+		}
+		if (env.verbose)
+			fprintf(stderr, "Loaded cgroup subtree filter entries: %d\n", cgroups);
+	}
 
 	int tracked_count = populate_initial_pids(&pid_tracker);
 	if (tracked_count < 0) {
@@ -673,9 +873,11 @@ int main(int argc, char **argv)
 
 	if (env.verbose) {
 		fprintf(stderr, "Loaded process_new: trace_fs=%d trace_net=%d trace_signals=%d "
-			"trace_mem=%d trace_cow=%d filter_pids=%d initial_tracked=%d\n",
+			"trace_mem=%d trace_cow=%d filter_pids=%d filter_cgroup=%d filter_cgroup_children=%d cgroup_id=%llu initial_tracked=%d\n",
 			env.trace_fs, env.trace_net, env.trace_signals,
-			env.trace_mem, env.trace_cow, need_pid_filter, tracked_count);
+			env.trace_mem, env.trace_cow, need_pid_filter, need_cgroup_filter,
+			env.cgroup_filter_children,
+			(unsigned long long)cgroup_filter_id, tracked_count);
 	}
 
 	err = process_new_bpf__attach(skel);
@@ -707,6 +909,8 @@ int main(int argc, char **argv)
 	/* Main loop: poll ring buffer + periodic flush + resource sampling */
 	uint64_t last_flush_time = 0;
 	uint64_t last_sample_ms = 0;
+	uint64_t last_cgroup_refresh_time = 0;
+	print_clock_sync_anchor("start");
 
 	while (!exiting) {
 		/* Use shorter poll timeout if sampling at high frequency */
@@ -726,6 +930,15 @@ int main(int argc, char **argv)
 
 		/* Check flush timer */
 		uint64_t now = (uint64_t)time(NULL);
+		if (need_cgroup_filter && env.cgroup_filter_children &&
+		    now - last_cgroup_refresh_time >= 2) {
+			int rc = populate_cgroup_filter_map(env.cgroup_filter_path, true, g_tracked_cgroups_fd);
+			if (rc < 0 && env.verbose) {
+				fprintf(stderr, "Warning: failed to refresh cgroup subtree map: %s\n",
+				        strerror(-rc));
+			}
+			last_cgroup_refresh_time = now;
+		}
 		if (now - last_flush_time >= FLUSH_INTERVAL_S) {
 			if (g_agg_map_fd >= 0)
 				flush_agg_map(g_agg_map_fd);
@@ -750,6 +963,7 @@ int main(int argc, char **argv)
 	/* Final flush on exit */
 	if (g_agg_map_fd >= 0)
 		flush_agg_map(g_agg_map_fd);
+	print_clock_sync_anchor("end");
 
 cleanup:
 	ring_buffer__free(rb);

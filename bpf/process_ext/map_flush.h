@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdbool.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include "process_new.h"
@@ -48,15 +49,59 @@ static void json_escape(const char *src, char *dst, size_t dst_size)
 	dst[j] = '\0';
 }
 
+static bool parse_fd_detail(const char *detail, int *fd_out)
+{
+	if (!detail || strncmp(detail, "fd=", 3) != 0)
+		return false;
+
+	char *end = NULL;
+	long fd = strtol(detail + 3, &end, 10);
+	if (end == detail + 3 || (end && *end != '\0'))
+		return false;
+
+	*fd_out = (int)fd;
+	return true;
+}
+
+static bool resolve_fd_path(uint32_t pid, int fd, char *out, size_t out_size)
+{
+	char fd_link[64];
+	char link_target[MAX_FILENAME_LEN];
+
+	snprintf(fd_link, sizeof(fd_link), "/proc/%u/fd/%d", pid, fd);
+	ssize_t n = readlink(fd_link, link_target, sizeof(link_target) - 1);
+	if (n <= 0)
+		return false;
+
+	link_target[n] = '\0';
+	strncpy(out, link_target, out_size - 1);
+	out[out_size - 1] = '\0';
+	return true;
+}
+
 static void print_summary_json(const struct agg_key *key, const struct agg_value *val)
 {
-	char detail_esc[DETAIL_LEN * 2];
+	char detail_esc[MAX_FILENAME_LEN * 2];
+	char detail_path[MAX_FILENAME_LEN];
 	char extra_esc[MAX_FILENAME_LEN * 2];
 	char comm_esc[TASK_COMM_LEN * 2];
+	int fd = -1;
+	bool parsed_fd = false;
+	bool resolved_path = false;
 
-	json_escape(key->detail, detail_esc, sizeof(detail_esc));
 	json_escape(val->extra, extra_esc, sizeof(extra_esc));
 	json_escape(val->comm, comm_esc, sizeof(comm_esc));
+
+	if (key->event_type == EVENT_TYPE_WRITE) {
+		parsed_fd = parse_fd_detail(key->detail, &fd);
+		if (parsed_fd)
+			resolved_path = resolve_fd_path(key->pid, fd, detail_path, sizeof(detail_path));
+	}
+
+	if (resolved_path)
+		json_escape(detail_path, detail_esc, sizeof(detail_esc));
+	else
+		json_escape(key->detail, detail_esc, sizeof(detail_esc));
 
 	printf("{\"timestamp\":%llu,\"event\":\"SUMMARY\","
 	       "\"comm\":\"%s\",\"pid\":%u,"
@@ -68,6 +113,11 @@ static void print_summary_json(const struct agg_key *key, const struct agg_value
 
 	if (val->total_bytes > 0)
 		printf(",\"total_bytes\":%llu", (unsigned long long)val->total_bytes);
+
+	if (key->event_type == EVENT_TYPE_WRITE && parsed_fd) {
+		printf(",\"fd\":%d", fd);
+		printf(",\"path_resolved\":%s", resolved_path ? "true" : "false");
+	}
 
 	if (extra_esc[0])
 		printf(",\"extra\":\"%s\"", extra_esc);
