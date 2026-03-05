@@ -20,6 +20,7 @@
 #include "process_filter.h"
 #include "process_ext/map_flush.h"
 #include "process_ext/mem_info.h"
+#include "process_ext/resource_sampler.h"
 
 #define MAX_COMMAND_LIST 256
 #define FILE_DEDUP_WINDOW_NS 60000000000ULL  /* 60 seconds */
@@ -69,12 +70,17 @@ static struct env {
 	bool trace_signals;
 	bool trace_mem;
 	bool trace_cow;
+	bool trace_resources;
+	bool resource_detail;
+	int sample_interval_ms;
+	char cgroup_path[256];
 } env = {
 	.verbose = false,
 	.min_duration_ms = 0,
 	.command_count = 0,
 	.filter_mode = FILTER_MODE_PROC,
 	.pid = 0,
+	.sample_interval_ms = 1000,
 };
 
 static struct pid_tracker pid_tracker;
@@ -84,9 +90,13 @@ static struct process_new_bpf *g_skel;
 static int g_agg_map_fd = -1;
 static int g_tracked_pids_fd = -1;
 static int g_overflow_fd = -1;
+static int g_exit_mem_fd = -1;
 
 /* Page size for memory info */
 static long page_size_kb;
+
+/* Target PID for resource sampling (set from -p or first matched process) */
+static pid_t g_resource_target_pid = 0;
 
 const char *argp_program_version = "process-new-tracer 1.0";
 const char *argp_program_bug_address = "<bpf@vger.kernel.org>";
@@ -105,6 +115,10 @@ enum {
 	OPT_TRACE_MEM,
 	OPT_TRACE_COW,
 	OPT_TRACE_ALL,
+	OPT_TRACE_RESOURCES,
+	OPT_RESOURCE_DETAIL,
+	OPT_SAMPLE_INTERVAL,
+	OPT_CGROUP,
 };
 
 static const struct argp_option opts[] = {
@@ -120,6 +134,10 @@ static const struct argp_option opts[] = {
 	{ "trace-mem", OPT_TRACE_MEM, NULL, 0, "Trace shared memory (mmap MAP_SHARED)" },
 	{ "trace-cow", OPT_TRACE_COW, NULL, 0, "Trace CoW page faults (kprobe/do_wp_page, high overhead)" },
 	{ "trace-all", OPT_TRACE_ALL, NULL, 0, "Enable all tracing except --trace-cow" },
+	{ "trace-resources", OPT_TRACE_RESOURCES, NULL, 0, "Sample memory/CPU periodically for tracked processes" },
+	{ "resource-detail", OPT_RESOURCE_DETAIL, NULL, 0, "Also output per-process resource detail (requires --trace-resources)" },
+	{ "sample-interval", OPT_SAMPLE_INTERVAL, "MS", 0, "Resource sampling interval in milliseconds (default: 1000)" },
+	{ "cgroup", OPT_CGROUP, "PATH", 0, "Cgroup v2 path for resource sampling (auto-detected if omitted)" },
 	{},
 };
 
@@ -210,6 +228,21 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		env.trace_signals = true;
 		env.trace_mem = true;
 		/* trace_cow NOT included in trace-all */
+		break;
+	case OPT_TRACE_RESOURCES:
+		env.trace_resources = true;
+		break;
+	case OPT_RESOURCE_DETAIL:
+		env.resource_detail = true;
+		break;
+	case OPT_SAMPLE_INTERVAL:
+		env.sample_interval_ms = atoi(arg);
+		if (env.sample_interval_ms < 10)
+			env.sample_interval_ms = 10;
+		break;
+	case OPT_CGROUP:
+		strncpy(env.cgroup_path, arg, sizeof(env.cgroup_path) - 1);
+		env.cgroup_path[sizeof(env.cgroup_path) - 1] = '\0';
 		break;
 	case ARGP_KEY_ARG:
 		argp_usage(state);
@@ -471,10 +504,15 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 			if (e->duration_ns)
 				printf(",\"duration_ms\":%llu", (unsigned long long)(e->duration_ns / 1000000));
 
-			/* Memory info at exit */
-			struct proc_mem_info mem;
-			if (read_proc_mem_info(e->pid, &mem)) {
-				printf(",\"vm_hwm_kb\":%ld", mem.vm_hwm_kb);
+			/* Memory info at exit (from BPF exit_mem map) */
+			if (g_exit_mem_fd >= 0) {
+				uint32_t mem_pid = e->pid;
+				struct exit_mem_info emem = {};
+				if (bpf_map_lookup_elem(g_exit_mem_fd, &mem_pid, &emem) == 0) {
+					printf(",\"vm_hwm_kb\":%llu",
+					       (unsigned long long)(emem.hiwater_rss * page_size_kb));
+					bpf_map_delete_elem(g_exit_mem_fd, &mem_pid);
+				}
 			}
 
 			printf("}\n");
@@ -489,6 +527,17 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 		} else {
 			if (should_track_process(tracker, e->comm, e->pid, e->ppid)) {
 				pid_tracker_add(tracker, e->pid, e->ppid);
+
+				/* Set resource sampling target from first matching EXEC */
+				if (env.trace_resources && g_resource_target_pid == 0 &&
+				    tracker->command_filter_count > 0 &&
+				    command_matches_any_filter(e->comm, tracker->command_filters,
+				                              tracker->command_filter_count)) {
+					g_resource_target_pid = e->pid;
+					/* Auto-detect cgroup path if not specified */
+					if (env.cgroup_path[0] == '\0')
+						detect_cgroup_path(e->pid, env.cgroup_path, sizeof(env.cgroup_path));
+				}
 
 				/* Add to BPF tracked_pids */
 				if (g_tracked_pids_fd >= 0) {
@@ -614,6 +663,7 @@ int main(int argc, char **argv)
 	g_agg_map_fd = bpf_map__fd(skel->maps.event_agg_map);
 	g_tracked_pids_fd = bpf_map__fd(skel->maps.tracked_pids);
 	g_overflow_fd = bpf_map__fd(skel->maps.agg_overflow_count);
+	g_exit_mem_fd = bpf_map__fd(skel->maps.exit_mem);
 
 	int tracked_count = populate_initial_pids(&pid_tracker);
 	if (tracked_count < 0) {
@@ -641,11 +691,30 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	/* Main loop: poll ring buffer + periodic flush */
+	/* Set resource target PID from -p option if specified */
+	if (env.trace_resources && env.pid > 0)
+		g_resource_target_pid = env.pid;
+
+	/* Auto-detect cgroup path if --trace-resources but no --cgroup specified */
+	if (env.trace_resources && !env.cgroup_path[0]) {
+		pid_t detect_pid = env.pid > 0 ? env.pid : getpid();
+		if (detect_cgroup_path(detect_pid, env.cgroup_path, sizeof(env.cgroup_path))) {
+			if (env.verbose)
+				fprintf(stderr, "Auto-detected cgroup: %s\n", env.cgroup_path);
+		}
+	}
+
+	/* Main loop: poll ring buffer + periodic flush + resource sampling */
 	uint64_t last_flush_time = 0;
+	uint64_t last_sample_ms = 0;
 
 	while (!exiting) {
-		err = ring_buffer__poll(rb, POLL_TIMEOUT_MS);
+		/* Use shorter poll timeout if sampling at high frequency */
+		int poll_ms = POLL_TIMEOUT_MS;
+		if (env.trace_resources && env.sample_interval_ms < poll_ms)
+			poll_ms = env.sample_interval_ms;
+
+		err = ring_buffer__poll(rb, poll_ms);
 		if (err == -EINTR) {
 			err = 0;
 			break;
@@ -663,6 +732,18 @@ int main(int argc, char **argv)
 			if (g_overflow_fd >= 0)
 				check_overflow(g_overflow_fd);
 			last_flush_time = now;
+		}
+
+		/* Resource sampling at configured interval */
+		if (env.trace_resources && g_resource_target_pid > 0) {
+			struct timespec ts;
+			clock_gettime(CLOCK_MONOTONIC, &ts);
+			uint64_t now_ms = (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+			if (now_ms - last_sample_ms >= (uint64_t)env.sample_interval_ms) {
+				sample_resources(g_resource_target_pid, page_size_kb,
+						 env.resource_detail, env.cgroup_path);
+				last_sample_ms = now_ms;
+			}
 		}
 	}
 

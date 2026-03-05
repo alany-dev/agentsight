@@ -48,6 +48,14 @@ struct {
 	__type(value, u64);
 } agg_overflow_count SEC(".maps");
 
+/* Per-process memory info at exit (BPF-side, read by userspace) */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4096);
+	__type(key, u32);    /* pid */
+	__type(value, struct exit_mem_info);
+} exit_mem SEC(".maps");
+
 /* write() enter/exit pairing context (not aggregation) */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -204,6 +212,18 @@ int handle_exit(struct trace_event_raw_sched_process_template *ctx)
 	e->timestamp_ns = ts;
 	e->exit_code = (BPF_CORE_READ(task, exit_code) >> 8) & 0xff;
 	bpf_get_current_comm(&e->comm, sizeof(e->comm));
+
+	/* Capture peak RSS from task->signal->maxrss.
+	 * At sched_process_exit, task->mm is already NULL (exit_mm() ran first),
+	 * but signal->maxrss was set during exit_mm() and holds peak RSS in KB. */
+	{
+		struct exit_mem_info mem = {};
+		mem.hiwater_rss = BPF_CORE_READ(task, signal, maxrss);
+		if (mem.hiwater_rss > 0) {
+			u32 pid_key = pid;
+			bpf_map_update_elem(&exit_mem, &pid_key, &mem, BPF_ANY);
+		}
+	}
 
 	bpf_ringbuf_submit(e, 0);
 	return 0;

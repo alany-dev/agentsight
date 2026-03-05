@@ -24,6 +24,12 @@ struct agg_value {
 	char extra[MAX_FILENAME_LEN];
 };
 
+/* Per-process memory info collected in BPF at exit time.
+ * Stored in exit_mem BPF hash map, read by userspace in handle_event. */
+struct exit_mem_info {
+	__u64 hiwater_rss;  /* peak RSS in pages (from signal->maxrss) */
+};
+
 /* New event type IDs (existing 0-2 unchanged in process.h) */
 enum event_type_new {
 	/* filesystem mutations */

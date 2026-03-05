@@ -844,6 +844,96 @@ def test_idempotent():
     print(f"  [PASS] Both sessions succeeded")
 
 
+def test_trace_resources():
+    """--trace-resources outputs RESOURCE_SAMPLE events with valid fields."""
+    print("test_trace_resources: RESOURCE_SAMPLE event with memory/CPU stats")
+    # Start a long-running process and pass its PID with -p
+    target = subprocess.Popen(
+        ["python3", "-c", "import time; time.sleep(10)"]
+    )
+    time.sleep(0.5)  # let it start
+    sess = TracerSession("-m", "2", "-p", str(target.pid), "--trace-resources")
+    try:
+        time.sleep(3)  # need at least 2 samples
+        target.terminate()
+        target.wait()
+        time.sleep(1)
+        sess.stop()
+
+        samples = sess.find(event="RESOURCE_SAMPLE")
+        assert len(samples) >= 2, (
+            f"FAIL: Expected >=2 RESOURCE_SAMPLE, got {len(samples)}"
+        )
+        print(f"  [PASS] Got {len(samples)} RESOURCE_SAMPLE events")
+
+        # Validate fields
+        s = samples[0]
+        assert "total_rss_kb" in s, "FAIL: missing total_rss_kb"
+        assert "total_cpu_user_ms" in s, "FAIL: missing total_cpu_user_ms"
+        assert "total_cpu_sys_ms" in s, "FAIL: missing total_cpu_sys_ms"
+        assert "num_processes" in s, "FAIL: missing num_processes"
+        assert s["total_rss_kb"] > 0, "FAIL: total_rss_kb should be > 0"
+        assert s["num_processes"] > 0, "FAIL: num_processes should be > 0"
+        assert s["target_pid"] == target.pid, "FAIL: target_pid mismatch"
+        print(f"  [PASS] RESOURCE_SAMPLE has valid fields "
+              f"(rss={s['total_rss_kb']/1024:.0f}MB, procs={s['num_processes']}, "
+              f"target_pid={s['target_pid']})")
+
+        # Check cgroup fields (may or may not be present)
+        if "cgroup_memory_bytes" in s:
+            assert s["cgroup_memory_bytes"] > 0, "FAIL: cgroup_memory_bytes should be > 0"
+            print(f"  [PASS] Cgroup stats present (memory={s['cgroup_memory_bytes']/(1024*1024):.0f}MB)")
+        else:
+            print(f"  [INFO] No cgroup stats (OK if cgroup v2 not available)")
+    finally:
+        try:
+            target.kill()
+        except ProcessLookupError:
+            pass
+        sess.cleanup()
+
+
+def test_resource_detail():
+    """--resource-detail outputs per-process RESOURCE_DETAIL events."""
+    print("test_resource_detail: per-process RESOURCE_DETAIL events")
+    sess = TracerSession("-c", "python3", "--trace-resources", "--resource-detail")
+    try:
+        # Run python3 with some memory allocation
+        proc = subprocess.Popen(
+            ["python3", "-c", "x = bytearray(10*1024*1024); import time; time.sleep(3)"]
+        )
+        time.sleep(4)
+        proc.wait()
+        time.sleep(1)
+        sess.stop()
+
+        details = sess.find(event="RESOURCE_DETAIL")
+        # Should have at least one RESOURCE_DETAIL for python3
+        py_details = [d for d in details if d.get("comm") == "python3"]
+        assert len(py_details) > 0, (
+            f"FAIL: Expected RESOURCE_DETAIL for python3, got 0 "
+            f"(total details: {len(details)})"
+        )
+        print(f"  [PASS] Got {len(py_details)} RESOURCE_DETAIL for python3")
+
+        # Validate fields
+        d = py_details[0]
+        assert "pid" in d, "FAIL: missing pid"
+        assert "rss_kb" in d, "FAIL: missing rss_kb"
+        assert "cpu_user_ms" in d, "FAIL: missing cpu_user_ms"
+        assert "cpu_sys_ms" in d, "FAIL: missing cpu_sys_ms"
+        assert d["rss_kb"] > 0, "FAIL: python3 rss_kb should be > 0"
+        print(f"  [PASS] RESOURCE_DETAIL has valid fields "
+              f"(pid={d['pid']}, rss={d['rss_kb']/1024:.1f}MB)")
+
+        # Also check that RESOURCE_SAMPLE aggregate is present
+        samples = sess.find(event="RESOURCE_SAMPLE")
+        assert len(samples) > 0, "FAIL: Expected RESOURCE_SAMPLE alongside detail"
+        print(f"  [PASS] RESOURCE_SAMPLE also present ({len(samples)} events)")
+    finally:
+        sess.cleanup()
+
+
 # ---------------------------------------------------------------------------
 # Test runner
 # ---------------------------------------------------------------------------
@@ -868,6 +958,8 @@ ALL_TESTS = [
     test_trace_mem,
     test_duration_filter,
     test_idempotent,
+    test_trace_resources,
+    test_resource_detail,
 ]
 
 

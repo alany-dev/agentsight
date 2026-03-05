@@ -177,6 +177,18 @@ static inline bool should_report_file_ops(struct pid_tracker *tracker, pid_t pid
 	return pid_tracker_is_tracked(tracker, pid);
 }
 
+/* Iterate over all active tracked PIDs */
+typedef void (*pid_visitor_fn)(pid_t pid, pid_t ppid, void *ctx);
+static inline void pid_tracker_foreach(struct pid_tracker *tracker,
+                                       pid_visitor_fn fn, void *ctx)
+{
+	for (int i = 0; i < TRACKED_PIDS_HASH_SIZE; i++) {
+		struct tracked_pid_entry *entry = &tracker->entries[i];
+		if (entry->is_active)
+			fn(entry->pid, entry->ppid, ctx);
+	}
+}
+
 /* Check if bash readline should be reported */
 static inline bool should_report_bash_readline(struct pid_tracker *tracker, pid_t pid)
 {
