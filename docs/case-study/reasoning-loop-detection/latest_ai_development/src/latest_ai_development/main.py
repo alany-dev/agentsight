@@ -1,4 +1,7 @@
 #!/usr/bin/env python
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 eunomia-bpf org.
+
 # src/my_project/main.py
 import os
 import sys

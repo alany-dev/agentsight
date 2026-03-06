@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 eunomia-bpf org.
+
 from typing import List, Tuple
 from crewai_tools import BaseTool
 

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 eunomia-bpf org.
+
 import os
 import sys
 from langchain.tools import tool
