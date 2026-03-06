@@ -4,6 +4,16 @@
 
 AgentSight MCP (Model Context Protocol) server exposes AgentSight's observability capabilities as MCP tools, enabling AI assistants to monitor, analyze, and debug AI agent behavior through SSL/TLS traffic interception and process monitoring.
 
+## Current Status
+
+The production MCP server described in this document is still a design target.
+For a runnable local fixture that can be used to test MCP flows today, see
+[`docs/mcp-test/README.md`](../../docs/mcp-test/README.md). That fixture includes:
+
+- a minimal MCP test server
+- a matching test CLI
+- both `stdio` and HTTP transport modes
+
 ## Motivation
 
 Unlike schedcp which manages kernel schedulers, AgentSight MCP provides:
