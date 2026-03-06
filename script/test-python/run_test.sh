@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 eunomia-bpf org.
+
 # Run sslsniff and capture OpenAI traffic to a temp file
 
 set -e

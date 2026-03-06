@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 eunomia-bpf org.
+
 use super::{Runner, SslConfig, EventStream, RunnerError};
 use super::common::{BinaryExecutor, AnalyzerProcessor};
 use crate::framework::core::Event;

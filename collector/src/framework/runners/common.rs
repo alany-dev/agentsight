@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 eunomia-bpf org.
+
 use crate::framework::analyzers::Analyzer;
 use super::{EventStream, RunnerError};
 use std::process::Stdio;

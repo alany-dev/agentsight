@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 eunomia-bpf org.
+
 'use client';
 
 import { useState, useMemo, useEffect, useCallback } from 'react';

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 eunomia-bpf org.
+
 import { Event, ProcessedEvent } from '@/types/event';
 
 export const SOURCE_COLORS = [

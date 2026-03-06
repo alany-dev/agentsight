@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 eunomia-bpf org.
+
 use crate::framework::core::Event;
 use async_trait::async_trait;
 use futures::stream::Stream;

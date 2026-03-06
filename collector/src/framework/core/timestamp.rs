@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 eunomia-bpf org.
+
 /// Timestamp conversion utilities
 ///
 /// All timestamps in the system are standardized to milliseconds since UNIX epoch

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 eunomia-bpf org.
+
 import { ParsedEvent } from '@/utils/eventParsers';
 import { UnifiedBlockData } from './UnifiedBlock';
 import { 

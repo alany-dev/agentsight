@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 eunomia-bpf org.
+
 use rust_embed::RustEmbed;
 use std::borrow::Cow;
 use std::path::PathBuf;

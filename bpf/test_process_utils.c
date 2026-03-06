@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 eunomia-bpf org.
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

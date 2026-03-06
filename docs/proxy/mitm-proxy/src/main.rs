@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 eunomia-bpf org.
+
 use bytes::Bytes;
 use hudsucker::{
     async_trait::async_trait,

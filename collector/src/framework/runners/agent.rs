@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 eunomia-bpf org.
+
 use super::{Runner, EventStream, RunnerError};
 use crate::framework::analyzers::Analyzer;
 use async_trait::async_trait;

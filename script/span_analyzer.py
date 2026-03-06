@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 eunomia-bpf org.
+
 """
 Lightweight observability analyzer for SSL JSON logs
 Converts HTTP request/response data into spans and traces

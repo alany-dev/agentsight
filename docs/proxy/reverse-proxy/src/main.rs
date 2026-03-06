@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 eunomia-bpf org.
+
 use axum::{
     Router, body::Body, extract::{Request, State}, http::{StatusCode, header::{AUTHORIZATION, CONTENT_TYPE}}, response::Response,
 };

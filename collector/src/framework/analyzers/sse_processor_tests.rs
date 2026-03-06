@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 eunomia-bpf org.
+
 #[cfg(test)]
 mod sse_processor_tests {
     use super::super::sse_processor::SSEProcessor;

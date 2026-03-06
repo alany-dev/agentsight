@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 eunomia-bpf org.
+
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;

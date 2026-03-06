@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 eunomia-bpf org.
+
 use clap::{Parser, Subcommand};
 use futures::stream::StreamExt;
 use std::sync::atomic::{AtomicBool, Ordering};

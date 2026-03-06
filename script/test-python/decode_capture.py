@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 eunomia-bpf org.
+
 """
 Decode captured SSL traffic from AgentSight JSON output.
 Identifies and decodes binary data (gzip, etc.) from captured events.

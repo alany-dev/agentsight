@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 eunomia-bpf org.
+
 set -e
 
 echo "Testing AgentSight Docker with Binary Path Mapping"

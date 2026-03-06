@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 eunomia-bpf org.
+
 """Simple decoder - just paste the base64 or hex data."""
 import gzip
 import base64

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 eunomia-bpf org.
+
 use crate::framework::core::Event;
 use crate::server::assets::FrontendAssets;
 use hyper::server::conn::http1;

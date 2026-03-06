@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 eunomia-bpf org.
+
 // JSON Diff utility for comparing AI prompts
 import { diffLines, Change } from 'diff';
 

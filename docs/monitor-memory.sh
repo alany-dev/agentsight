@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 eunomia-bpf org.
+
 
 # Memory monitoring script for process and subprocesses
 # Usage: ./monitor-memory.sh -p PID [-i interval] [-o output.csv] [-t threshold] [-a] [-n name]

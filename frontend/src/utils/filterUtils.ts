@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 eunomia-bpf org.
+
 import { Event } from '@/types/event';
 import { ProcessNode, parseEventData } from './eventParsers';
 import { ProcessTreeFilters } from '@/components/process-tree/ProcessTreeFilters';

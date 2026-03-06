@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 eunomia-bpf org.
+
 
 # Setup script for prompt injection detection experiment
 # This creates a malicious repository and web servers for scientific research

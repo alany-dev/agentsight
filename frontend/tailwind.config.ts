@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 eunomia-bpf org.
+
 import type { Config } from 'tailwindcss'
 
 const config: Config = {

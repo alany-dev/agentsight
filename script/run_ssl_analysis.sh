@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 eunomia-bpf org.
+
 
 # SSL Analysis Runner Script
 # Usage: ./run_ssl_analysis.sh <ssl_log_file>
