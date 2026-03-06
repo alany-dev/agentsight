@@ -2,6 +2,7 @@
 /bootstrap
 /sslsniff
 /browsertrace
+/stdiocap
 /process
 /test_process_utils
 /test_process_filter

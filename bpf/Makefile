@@ -31,7 +31,7 @@ CFLAGS += $(ASAN_FLAGS)
 ALL_LDFLAGS += $(ASAN_FLAGS)
 endif
 
-APPS = sslsniff browsertrace process process_new test_process_utils test_process_filter test_process_new_map_flush test_process_new_mem_info test_process_new_header # minimal minimal_legacy uprobe kprobe fentry usdt sockfilter tc ksyscall
+APPS = sslsniff browsertrace stdiocap process process_new test_process_utils test_process_filter test_process_new_map_flush test_process_new_mem_info test_process_new_header # minimal minimal_legacy uprobe kprobe fentry usdt sockfilter tc ksyscall
 
 # All test programs (no BPF skeleton needed)
 TEST_APPS = test_process_utils test_process_filter test_process_new_map_flush test_process_new_mem_info test_process_new_header
@@ -100,6 +100,7 @@ help:
 	@echo "  all          - Build all applications"
 	@echo "  sslsniff     - Build sslsniff only"
 	@echo "  browsertrace - Build browsertrace only"
+	@echo "  stdiocap     - Build stdiocap only"
 	@echo "  process      - Build process tracer only"
 	@echo "  test         - Build and run tests"
 	@echo "  debug        - Build all applications with AddressSanitizer"
