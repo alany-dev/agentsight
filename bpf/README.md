@@ -1,6 +1,6 @@
 # eBPF Monitoring Tools
 
-This directory contains two powerful eBPF-based monitoring tools for system observability and security analysis.
+This directory contains eBPF-based monitoring tools for system observability and security analysis.
 
 ## Tools Overview
 
@@ -184,6 +184,43 @@ When `--binary-path` is specified, sslsniff:
 - **Command filtering**: Only capture traffic from matching command names
 - **Library filtering**: Choose which SSL libraries to monitor
 
+### 3. Stdio Payload Capture (`stdiocap`)
+
+An eBPF-based stdio and pipe payload tracer for local process communication.
+This is useful for cases like local MCP over `stdio`, where SSL/TLS tracing does
+not apply but you still need to see request/response payloads.
+
+**Key Features:**
+- Capture `read` and `write` payloads from a target process
+- Default focus on `stdin` / `stdout` / `stderr`
+- Optional all-FD mode for tracing pipe-based client processes
+- JSON output with PID, FD role, FD target, latency, and payload content
+
+**Usage:**
+```bash
+sudo ./stdiocap -p PID [OPTIONS]
+```
+
+**Command Line Arguments:**
+
+| Argument | Short | Description | Default |
+|----------|-------|-------------|---------|
+| `--pid=PID` | `-p PID` | Trace this PID only | required |
+| `--uid=UID` | `-u UID` | Trace this UID only | all |
+| `--comm=COMMAND` | `-c COMMAND` | Trace only commands matching string | all |
+| `--all-fds` | - | Capture all FDs instead of only `0/1/2` | disabled |
+| `--max-bytes=BYTES` | - | Maximum bytes emitted per event | 8192 |
+| `--verbose` | `-v` | Enable verbose libbpf debug output | disabled |
+
+**Examples:**
+```bash
+# Trace MCP stdio payloads from a local server process
+sudo ./stdiocap -p 12345
+
+# Trace a client process whose MCP pipe FDs are not 0/1/2
+sudo ./stdiocap -p 12345 --all-fds
+```
+
 ## Building the Tools
 
 ### Prerequisites
@@ -203,6 +240,7 @@ make build
 # Build individual tools
 make process
 make sslsniff
+make stdiocap
 
 # Build with debugging symbols
 make debug
